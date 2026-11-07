@@ -11,8 +11,6 @@ autostart: false
 stations:
   - name: Radio Leipzig
     url: http://streaming.radioleipzig.de/radio-leipzig_simulcast_192k_mp3
-  - name: Antenne Bayern Lounge
-    url: https://stream.webradio.de/lounge
   - name: Klassik Radio
     url: https://live.streams.klassikradio.de/klassikradio-deutschland/stream/mp3?aggregator=select&nonce=
   - name: KR New Classics

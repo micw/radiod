@@ -197,12 +197,23 @@ impl Audio {
                 }
                 MessageView::Buffering(buffering) => {
                     let percent = buffering.percent().clamp(0, 100) as u8;
-                    events.push(Event::Buffering(percent));
                     let mut latency = gst::query::Latency::new();
                     if self.pipeline.query(&mut latency) && latency.result().0 {
                         self.live = true;
                     }
-                    if !self.live {
+                    // Live-ness can only become known after preroll. If a prior
+                    // buffering message paused the pipeline, explicitly undo it.
+                    if self.live {
+                        let was_paused = std::mem::replace(&mut self.buffering, false);
+                        if was_paused
+                            && let Err(error) = self.pipeline.set_state(gst::State::Playing)
+                        {
+                            events.push(Event::Error(error.to_string()));
+                            let _ = self.stop();
+                            break;
+                        }
+                    } else {
+                        events.push(Event::Buffering(percent));
                         let pause = percent < 100;
                         if self.buffering != pause {
                             self.buffering = pause;
@@ -233,7 +244,9 @@ impl Audio {
                             }
                         }
                     }
-                    if percent == 100 && self.pipeline.current_state() == gst::State::Playing {
+                    if (self.live || percent == 100)
+                        && self.pipeline.current_state() == gst::State::Playing
+                    {
                         events.push(Event::Playing);
                     }
                 }
@@ -257,5 +270,38 @@ impl Drop for Audio {
     fn drop(&mut self) {
         self.bus.set_flushing(true);
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn live_discovery_resumes_a_previously_buffer_paused_pipeline() {
+        gst::init().unwrap();
+        let mut audio = Audio::new("default", "default", "Master", true).unwrap();
+        audio.pipeline =
+            gst::parse::launch("audiotestsrc is-live=true ! fakesink sync=true").unwrap();
+        audio.bus = audio.pipeline.bus().unwrap();
+        audio.pipeline.set_state(gst::State::Paused).unwrap();
+        audio.active = true;
+        audio.live = true; // discovered after the earlier buffering pause
+        audio.buffering = true;
+        audio
+            .bus
+            .post(
+                gst::message::Buffering::builder(10)
+                    .src(&audio.pipeline)
+                    .build(),
+            )
+            .unwrap();
+        audio.poll();
+        assert!(
+            !audio.buffering,
+            "live discovery must release the old pause"
+        );
+        let (result, state, _) = audio.pipeline.state(gst::ClockTime::from_seconds(2));
+        result.unwrap();
+        assert_eq!(state, gst::State::Playing);
     }
 }

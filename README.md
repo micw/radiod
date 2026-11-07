@@ -31,8 +31,10 @@ actual host instead of assuming that either that ID or numeric card 1 is stable.
 
 ## Configuration
 
-[radiod.yaml](radiod.yaml) migrates all 17 entries from the existing MPD chart,
-including the two differently addressed “Antenne Bayern Lounge” entries.
+[radiod.yaml](radiod.yaml) migrates the existing MPD chart's station list.
+The duplicate “Antenne Bayern Lounge” entry is consolidated to the direct
+`s5-webradio.antenne.de` URL, leaving 16 stations. Alternate URLs per station are
+not implemented in V1; internal MPD IDs still need no user configuration.
 Each station needs only `name` and an HTTP(S) `url`. URLs must be unique; names
 need not be. The list order is the initial queue order. Limits: 1 MiB config, 1024 stations,
 256 bytes per name, 4096 bytes per URL, timeout settings 1–3600 seconds.
@@ -100,6 +102,20 @@ Before replacing the old service, verify on the actual tablet:
 4. YAML rename/reorder/rejection/removal behavior and persisted restart state.
 5. Explicitly scheduled ALSA listening test with old MPD stopped, low initial gain,
    and a rollback path. No Kubernetes deployment is implied by this implementation.
+
+## Initial station probe
+
+Null-output probes reached playing for the ten non-404 stations, including the
+Ogg Radio Paradise stream and Radio Leipzig's AAC stream (despite its MP3-looking
+URL). Radio Leipzig exposed a live/buffering transition bug; after the fix it also
+reached playing. A regression test covers resuming a previously buffer-paused
+pipeline when its source is discovered to be live.
+
+A separate bounded HTTP GET probe returned 404 for the inherited KR New Classics,
+KR Klassik Meats Rock, KR Movie, KR Games, KR Lounge Beats and Charivari Lounge
+URLs. These six URLs remain in the configuration for explicit user review, not
+silently replaced. Network/provider behavior can change; these checks are not a
+listening or long-duration stability acceptance.
 
 ## Container and Talos mw-home
 

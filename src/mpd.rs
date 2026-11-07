@@ -413,8 +413,10 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
             if let Some(retry) = c.retry_seconds() {
                 out.push_str(&format!("radiod_retry: {retry}\n"));
             }
-            if c.error.is_some() {
-                out.push_str("error: Radio playback failed\nradiod_error: Radio playback failed\n");
+            if let Some(error) = &c.error {
+                out.push_str("error: Radio playback failed\n");
+                // Core errors are typed/safe diagnostics, not upstream debug text.
+                out.push_str(&format!("radiod_error: {}\n", clean(error)));
             }
             if c.persistence_error.is_some() {
                 out.push_str("radiod_persistence_error: Unable to save playback state\n");
