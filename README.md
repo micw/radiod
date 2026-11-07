@@ -160,12 +160,12 @@ to garbage collection. A local LAN registry is another option but requires separ
 routing/TLS/Talos-registry planning; node `localhost` is not the build host.
 ### GitHub image builds
 
-The GitHub Actions pipeline tests each main-branch push before publishing
-`ghcr.io/micw/radiod:main` and `ghcr.io/micw/radiod:sha-<full-commit>` for linux/amd64.
+The GitHub Actions pipeline tests each master-branch push before publishing
+`ghcr.io/micw/radiod:master` and `ghcr.io/micw/radiod:sha-<full-commit>` for linux/amd64.
 Version tags `v*` also publish the corresponding image tag. Pull requests run tests
 without registry writes. The workflow uses the repository's `GITHUB_TOKEN`, just
 like the existing Dockernode build; no manually stored registry token is needed.
-For reproducible cluster tests use the commit tag or digest, not the moving `main`.
+For reproducible cluster tests use the commit tag or digest, not the moving `master`.
 Ensure the resulting GHCR package is publicly pullable or configure imagePullSecrets.
 Publication does not deploy anything. No node cache mutation, shutdown of MPD or
 Kubernetes deployment is part of this build step.
