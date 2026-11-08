@@ -88,6 +88,14 @@ as well. Safe typed errors include HTTP status when available, without raw URL o
 upstream debug text. Logs include actual playback/buffering/retry transitions.
 `radiod_persistence_error` is separate: a disk error must not stop healthy audio.
 
+Stream metadata maps to MPD `Name` (station), `Title` (ICY StreamTitle) and
+`Artist` when separately supplied. Actual tag changes, explicit empty tags and
+source resets advance the queue version so clients such as MPDroid invalidate
+cached queue entries through `plchanges`. Identical repeated tags do not advance
+it; station IDs/order are unchanged. No fabricated Artist/Album tags are used to
+hide client UI elements. MPDroid's stream-list URL subtitle is client-side behavior;
+no sender icons or album-art commands are implemented.
+
 ## Native runtime compatibility
 
 The supported image uses Debian Trixie/GStreamer 1.26 and **libsoup 3.8.0**.
@@ -118,6 +126,7 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo build --locked
 python3 tests/smoke.py
 python3 tests/streaming.py
+python3 tests/metadata.py
 docker build -t radiod:test .
 ```
 
@@ -125,7 +134,7 @@ Normal tests are **offline**: generated WAV and a small synthetic AAC fixture ov
 loopback HTTP, including ICY titles, burst delivery, repeated starts/switches,
 reload, stop/retry and volume limits. No public station catalogue is embedded.
 `RADIOD_BINARY` can point the Python tests to a different binary. The Docker build
-runs both suites against its actual release binary/native runtime as a non-root
+runs these suites against its actual release binary/native runtime as a non-root
 user; a successful image build depends on those tests, not just the builder host.
 Null output simulates mixer volume and never accesses the actual sound device.
 These tests do not prove audible ALSA output or MPDroid interoperability.

@@ -41,7 +41,7 @@ ENV RADIOD_BINARY=/usr/local/bin/radiod RADIOD_TRACE_AUDIO=1
 USER 65532:65532
 RUN python3 -c 'import ctypes; s=ctypes.CDLL("libsoup-3.0.so.0"); v=tuple(getattr(s,"soup_get_"+n+"_version")() for n in ("major","minor","micro")); print("loaded libsoup:",v); assert v == (3,8,0)' \
     && radiod --config /examples/radiod.yaml --check-config \
-    && python3 /tests/smoke.py && python3 /tests/streaming.py \
+    && python3 /tests/smoke.py && python3 /tests/streaming.py && python3 /tests/metadata.py \
     && python3 -m unittest discover -s /tests -p 'test_*.py' \
     && printf 'release-runtime tests passed\n' > /tmp/radiod-test-passed
 

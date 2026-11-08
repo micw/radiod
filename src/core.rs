@@ -103,6 +103,25 @@ impl Core {
     pub fn changed(&mut self) {
         self.revision += 1;
     }
+    fn set_metadata(&mut self, title: Option<String>, artist: Option<String>) {
+        let title = title.filter(|s| !s.is_empty());
+        let artist = artist.filter(|s| !s.is_empty());
+        if self.title == title && self.artist == artist {
+            return;
+        }
+        self.title = title;
+        self.artist = artist;
+        // MPD clients cache queue entries by this version, including stream
+        // titles. An idle notification alone does not invalidate that cache.
+        self.playlist_version += 1;
+        self.changed();
+    }
+    fn receive_metadata(&mut self, title: Option<String>, artist: Option<String>) {
+        // Missing fields are partial updates; explicitly empty tags clear them.
+        let title = title.or_else(|| self.title.clone());
+        let artist = artist.or_else(|| self.artist.clone());
+        self.set_metadata(title, artist);
+    }
     pub fn save(&self) -> Result<()> {
         let saved = Saved {
             url: self
@@ -148,8 +167,7 @@ impl Core {
         self.stable = None;
         self.desired = true;
         self.state = "buffering".into();
-        self.title = None;
-        self.artist = None;
+        self.set_metadata(None, None);
         self.error = None;
         if let Err(e) = self.audio.play(&url) {
             self.failed(e.to_string());
@@ -160,6 +178,10 @@ impl Core {
     }
     pub fn select(&mut self, id: u32) -> Result<()> {
         anyhow::ensure!(self.queue.contains(&id), "unknown song");
+        if self.current != Some(id) {
+            // Invalidate the former queue entry before changing its ownership.
+            self.set_metadata(None, None);
+        }
         self.current = Some(id);
         self.attempt = 0;
         self.play()
@@ -235,15 +257,7 @@ impl Core {
                         self.changed();
                     }
                     Event::Buffering(p) => self.buffering(p),
-                    Event::Tags { title, artist } => {
-                        if title.is_some() {
-                            self.title = title;
-                        }
-                        if artist.is_some() {
-                            self.artist = artist;
-                        }
-                        self.changed();
-                    }
+                    Event::Tags { title, artist } => self.receive_metadata(title, artist),
                     Event::Ended => {
                         self.failed("unexpected end of live stream".into());
                         break;
@@ -416,6 +430,70 @@ mod tests {
         c.reload(new).unwrap();
         assert_eq!(c.current, None);
         assert_eq!(c.state, "stop");
+    }
+    #[test]
+    fn metadata_changes_invalidate_queue_cache_but_duplicates_do_not() {
+        let mut c = fixture();
+        let queue = c.queue.clone();
+        let current = c.current;
+        let version = c.playlist_version;
+        c.receive_metadata(Some("First title".into()), Some("Artist".into()));
+        assert_eq!(c.playlist_version, version + 1);
+        let revision = c.revision;
+        c.receive_metadata(Some("First title".into()), Some("Artist".into()));
+        c.receive_metadata(None, None);
+        assert_eq!(c.playlist_version, version + 1);
+        assert_eq!(c.revision, revision);
+        c.receive_metadata(Some("Second title".into()), None);
+        assert_eq!(c.artist.as_deref(), Some("Artist"));
+        assert_eq!(c.playlist_version, version + 2);
+        c.receive_metadata(None, Some("Another artist".into()));
+        assert_eq!(c.title.as_deref(), Some("Second title"));
+        assert_eq!(c.playlist_version, version + 3);
+        assert_eq!(c.queue, queue);
+        assert_eq!(c.current, current);
+    }
+    #[test]
+    fn empty_metadata_clears_fields_and_invalidates_once() {
+        let mut c = fixture();
+        c.receive_metadata(Some("Title".into()), Some("Artist".into()));
+        let version = c.playlist_version;
+        c.receive_metadata(Some(String::new()), None);
+        assert!(c.title.is_none());
+        assert_eq!(c.artist.as_deref(), Some("Artist"));
+        assert_eq!(c.playlist_version, version + 1);
+        c.receive_metadata(None, Some(String::new()));
+        assert!(c.artist.is_none());
+        assert_eq!(c.playlist_version, version + 2);
+        c.receive_metadata(Some(String::new()), Some(String::new()));
+        assert_eq!(c.playlist_version, version + 2);
+    }
+    #[test]
+    fn switching_station_invalidates_the_former_title_without_changing_ids() {
+        let mut c = fixture();
+        let queue = c.queue.clone();
+        c.receive_metadata(Some("Old source title".into()), Some("Old artist".into()));
+        let version = c.playlist_version;
+        c.select(queue[1]).unwrap();
+        assert_eq!(c.playlist_version, version + 1);
+        assert_eq!(c.queue, queue);
+        assert_eq!(c.current, Some(queue[1]));
+        assert!(c.title.is_none() && c.artist.is_none());
+    }
+    #[test]
+    fn reconnect_reset_invalidates_tags_but_not_queue_structure() {
+        let mut c = fixture();
+        let queue = c.queue.clone();
+        let current = c.current;
+        c.receive_metadata(Some("Old title".into()), None);
+        let version = c.playlist_version;
+        c.play().unwrap();
+        assert_eq!(c.playlist_version, version + 1);
+        assert!(c.title.is_none());
+        c.play().unwrap();
+        assert_eq!(c.playlist_version, version + 1);
+        assert_eq!(c.queue, queue);
+        assert_eq!(c.current, current);
     }
     #[test]
     fn volume_is_clamped() {
