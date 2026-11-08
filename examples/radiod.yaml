@@ -11,3 +11,13 @@ connect_timeout_seconds: 20
 autostart: false
 # Supply your own HTTP(S) streams, e.g. entries with name and url fields.
 stations: []
+# Optional LAN-only UPnP renderer. Enabling requires an explicit controller/media
+# allowlist and a bind address present on the selected network interface.
+upnp:
+  enabled: false
+  bind_address: 127.0.0.1
+  port: 8091
+  friendly_name: radiod
+  allowed_networks: []
+  prepared_timeout_seconds: 15
+  failure_timeout_seconds: 10

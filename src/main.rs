@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod core;
 mod mpd;
+mod upnp;
 use anyhow::{Context, Result};
 use std::{
     path::PathBuf,
@@ -42,7 +43,7 @@ fn main() -> Result<()> {
         &config.mixer_control,
         null,
     )?;
-    let core = Arc::new(Mutex::new(core::Core::new(config, audio, state)?));
+    let core = Arc::new(Mutex::new(core::Core::new(config, audio, state.clone())?));
     let worker = core.clone();
     std::thread::spawn(move || {
         let mut n = 0u64;
@@ -70,6 +71,7 @@ fn main() -> Result<()> {
             }
         }
     });
+    upnp::start(core.clone(), &state)?;
     eprintln!("radiod MPD listening on {}", listener.local_addr()?);
     mpd::serve(listener, core)
 }

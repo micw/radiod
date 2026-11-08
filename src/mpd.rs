@@ -381,7 +381,7 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
             if cmd == "lsinfo" {
                 out.push_str("playlist: radio\nLast-Modified: 1970-01-01T00:00:00Z\n");
             }
-            for s in &c.songs {
+            for s in c.songs.iter().filter(|s| !s.temporary) {
                 out.push_str(&song(c, s.id, None, cmd != "listall"));
             }
         }
@@ -402,13 +402,18 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
             };
             out = format!(
                 "volume: {}\nrepeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nplaylist: {}\nplaylistlength: {}\nmixrampdb: 0.000000\nstate: {state}\nradiod_state: {}\n",
-                c.volume,
+                c.effective_volume(),
                 c.playlist_version,
                 c.queue.len(),
                 clean(&c.state)
             );
             if let Some((id, pos)) = c.current.and_then(|id| c.queue.iter().position(|v| *v == id).map(|pos| (id, pos))) {
                 out.push_str(&format!("song: {pos}\nsongid: {id}\ntime: 0:0\nelapsed: 0.000\n"));
+            }
+            if let Some(session) = c.external_session_id() {
+                out.push_str(&format!("radiod_source: upnp\nradiod_session: {session}\n"));
+            } else {
+                out.push_str("radiod_source: radio\n");
             }
             if let Some(retry) = c.retry_seconds() {
                 out.push_str(&format!("radiod_retry: {retry}\n"));
@@ -422,7 +427,7 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
                 out.push_str("radiod_persistence_error: Unable to save playback state\n");
             }
         }
-        "stats" => out = format!("artists: 0\nalbums: 0\nsongs: {}\nuptime: 0\ndb_playtime: 0\ndb_update: 0\nplaytime: 0\n", c.songs.len()),
+        "stats" => out = format!("artists: 0\nalbums: 0\nsongs: {}\nuptime: 0\ndb_playtime: 0\ndb_update: 0\nplaytime: 0\n", c.radio_song_ids().len()),
         "currentsong" => {
             if let Some(id) = c.current {
                 out = song(c, id, c.queue.iter().position(|v| *v == id), true);
@@ -459,7 +464,7 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
             if p[0] != "radio" {
                 return Err((50, "no such playlist".into()));
             }
-            let ids: Vec<_> = c.songs.iter().map(|s| s.id).collect();
+            let ids: Vec<_> = c.radio_song_ids();
             if cmd == "load" {
                 let ids = if p.len() == 2 { ids[range(&p[1], ids.len())?].to_vec() } else { ids };
                 for id in ids {
@@ -481,7 +486,7 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
             queue_changed = true;
         }
         "add" | "addid" => {
-            let id = c.songs.iter().find(|s| s.station.url == p[0]).map(|s| s.id).ok_or((50, "only configured URLs are allowed".into()))?;
+            let id = c.songs.iter().find(|s| !s.temporary && s.station.url == p[0]).map(|s| s.id).ok_or((50, "only configured URLs are allowed".into()))?;
             let pos = if p.len() == 2 { number(&p[1])? } else { c.queue.len() };
             if pos > c.queue.len() {
                 return Err((50, "bad position".into()));
@@ -502,11 +507,12 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
             } else {
                 range(&p[0], c.queue.len())?
             };
-            if c.current.is_some_and(|id| c.queue[r.clone()].contains(&id)) {
+            let deleted = c.queue[r].to_vec();
+            if c.current.is_some_and(|id| deleted.contains(&id)) {
                 c.stop(false).map_err(|e| (52, e.to_string()))?;
                 c.current = None;
             }
-            c.queue.drain(r);
+            c.queue.retain(|id| !deleted.contains(id));
             queue_changed = true;
         }
         "move" | "moveid" | "swap" | "swapid" => {
@@ -563,16 +569,17 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
         }
         "stop" => c.stop(false).map_err(|e| (52, e.to_string()))?,
         "next" | "previous" => {
-            if !c.queue.is_empty() {
-                let pos = c.current.and_then(|id| c.queue.iter().position(|v| *v == id)).unwrap_or(0);
-                let next = if cmd == "next" { (pos + 1) % c.queue.len() } else { (pos + c.queue.len() - 1) % c.queue.len() };
-                c.select(c.queue[next]).map_err(|e| (52, e.to_string()))?;
+            let ids: Vec<_> = c.queue.iter().copied().filter(|id| c.song(*id).is_some_and(|s| !s.temporary)).collect();
+            if !ids.is_empty() {
+                let pos = c.current.and_then(|id| ids.iter().position(|v| *v == id));
+                let next = match pos { Some(pos) if cmd == "next" => (pos + 1) % ids.len(), Some(pos) => (pos + ids.len() - 1) % ids.len(), None if cmd == "next" => 0, None => ids.len()-1 };
+                c.select(ids[next]).map_err(|e| (52, e.to_string()))?;
             }
         }
         "setvol" | "volume" => {
             let n = p[0].parse::<i32>().map_err(|_| invalid("invalid volume"))?;
             let v = if cmd == "volume" {
-                (c.volume as i64 + n as i64).clamp(0, 100) as u8
+                (c.effective_volume() as i64 + n as i64).clamp(0, 100) as u8
             } else {
                 if !(0..=100).contains(&n) {
                     return Err(invalid("volume out of range"));
@@ -599,8 +606,7 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
     }
 
     if queue_changed {
-        c.playlist_version += 1;
-        c.changed();
+        c.queue_updated();
     }
     Ok(out)
 }
@@ -649,5 +655,83 @@ mod tests {
         peer.write_all(b"ng\nstatus\n").unwrap();
         assert_eq!(lines.next(&mut server).unwrap().unwrap(), "ping");
         assert_eq!(lines.next(&mut server).unwrap().unwrap(), "status");
+    }
+    #[test]
+    fn external_database_filter_and_deletion_are_safe() {
+        use crate::{
+            audio::Audio,
+            config::{Config, Station},
+        };
+        let config = Config {
+            stations: vec![Station {
+                name: "Radio".into(),
+                url: "http://127.0.0.1:1/radio".into(),
+            }],
+            ..Config::default()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "radiod-mpd-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut c = Core::new(
+            config,
+            Audio::new("default", "default", "Master", true).unwrap(),
+            path.clone(),
+        )
+        .unwrap();
+        let cmd = |s: &str| parse(s).unwrap();
+        c.play().unwrap();
+        c.prepare_external("owner", "http://127.0.0.1:1/external", None, None)
+            .unwrap();
+        let radio = c.radio_song_ids()[0];
+        execute(&mut c, &cmd(&format!("deleteid {radio}"))).unwrap();
+        assert!(c.external_session_id().is_some());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved["url"].is_null());
+        assert_eq!(saved["playing"], false);
+        c.external_stop("owner").unwrap();
+        assert!(c.current.is_none());
+        for deletion in [
+            "delete 0:2".to_string(),
+            "deleteid GHOST".to_string(),
+            "clear".to_string(),
+        ] {
+            c.queue = c.radio_song_ids();
+            c.current = c.queue.first().copied();
+            c.stop(false).unwrap();
+            c.external_stop("owner").unwrap(); // explicit fresh-cast boundary
+            c.prepare_external(
+                "owner",
+                "http://127.0.0.1:1/external",
+                Some("Foreign title".into()),
+                None,
+            )
+            .unwrap();
+            let ghost = c.current.unwrap();
+            assert!(
+                execute(&mut c, &cmd("playlistinfo"))
+                    .unwrap()
+                    .contains("Foreign title")
+            );
+            for query in ["listall", "listplaylist radio", "listplaylistinfo radio"] {
+                assert!(!execute(&mut c, &cmd(query)).unwrap().contains("external"));
+            }
+            assert!(execute(&mut c, &cmd("stats")).unwrap().contains("songs: 1"));
+            assert!(execute(&mut c, &cmd("add http://127.0.0.1:1/external")).is_err());
+            execute(&mut c, &cmd(&deletion.replace("GHOST", &ghost.to_string()))).unwrap();
+            assert!(c.external_session_id().is_none());
+            assert!(c.song(ghost).is_none());
+        }
+        c.set_mute(true).unwrap();
+        assert!(
+            execute(&mut c, &cmd("status"))
+                .unwrap()
+                .contains("volume: 0")
+        );
+        execute(&mut c, &cmd("volume 5")).unwrap();
+        assert_eq!(c.effective_volume(), 5);
+        assert!(!c.muted);
     }
 }

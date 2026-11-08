@@ -1,7 +1,9 @@
 # radiod — radio-only MPD replacement
 
 Rust + embedded GStreamer, an MPD-compatible TCP endpoint and direct ALSA mixer
-volume. No MPD daemon, music database, web UI, UPnP or phone-stream takeover in V1.
+volume. No MPD daemon, music database or web UI. An optional GUPnP-based audio
+MediaRenderer PoC supports temporary LAN streams and controlled radio return;
+see [UPnP setup, policy and limitations](docs/upnp.md). It is disabled by default.
 The first client target is MPDroid; MAFA / M.A.L.P. are later interoperability tests.
 
 ## Configuration belongs to the installation
@@ -116,8 +118,8 @@ compatible HTTP stack too; host success is not a substitute for image testing.
 
 ## Build and tests
 
-Native build prerequisites: Rust/Cargo, pkg-config, GStreamer and ALSA development
-files. Runtime tests require GStreamer base/good/bad/libav plugins for AAC/ICY and
+Native build prerequisites: Rust/Cargo, a C compiler, pkg-config, GStreamer,
+ALSA and GUPnP 1.6 development files. Runtime tests require GStreamer base/good/bad/libav plugins for AAC/ICY and
 WAV, plus Python 3. Follow the Dockerfile for the supported runtime/toolchain.
 
 ```sh
@@ -127,6 +129,7 @@ cargo build --locked
 python3 tests/smoke.py
 python3 tests/streaming.py
 python3 tests/metadata.py
+python3 tests/upnp.py
 docker build -t radiod:test .
 ```
 
