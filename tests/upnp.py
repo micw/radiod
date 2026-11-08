@@ -502,7 +502,7 @@ def main():
                 if process and process.poll() is None:
                     process.terminate()
                     try:
-                        process.wait(timeout=2)
+                        process.wait(timeout=4)  # includes bounded SSDP departure drain
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=1)

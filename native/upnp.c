@@ -12,6 +12,7 @@ typedef struct {
     GUPnPService *av, *rc, *cm;
     radiod_upnp_snapshot last;
     char *av_event, *rc_event;
+    gboolean stopping;
 } Server;
 static const char *state(int n) {
     static const char *s[] = {"STOPPED", "TRANSITIONING", "PLAYING", "PAUSED_PLAYBACK"};
@@ -85,7 +86,7 @@ static gboolean tick(gpointer data) {
 }
 static void query(GUPnPService *service, const char *name, GValue *value, gpointer data) {
     Server *s=data;
-    refresh(s,TRUE);
+    if (!s->stopping) refresh(s,TRUE);
     g_value_init(value,G_TYPE_STRING);
     const char *v="";
     if (!strcmp(name,"LastChange")) v=service==s->rc ? s->rc_event : s->av_event;
@@ -117,6 +118,7 @@ static gboolean input_uint(GUPnPServiceAction *a,const char *name,guint64 maximu
 }
 static void action(GUPnPService *service,GUPnPServiceAction *a,gpointer data) {
     Server *s=data;
+    if (s->stopping) { fail(a,501,"Renderer is shutting down"); return; }
     const char *n=gupnp_service_action_get_name(a);
     guint id=0;
     if (service!=s->cm) {
@@ -279,6 +281,10 @@ static void description(SoupServer *server,SoupServerMessage *message,const char
     soup_server_message_set_response(message,"text/xml; charset=\"utf-8\"",SOUP_MEMORY_COPY,xml,strlen(xml));
     soup_server_message_set_status(message,SOUP_STATUS_OK,NULL);
 }
+static gboolean drain_finished(gpointer data) {
+    g_main_loop_quit(data);
+    return G_SOURCE_REMOVE;
+}
 static char *replace(const char *text,const char *key,const char *value) {
     char **parts=g_strsplit(text,key,-1); char *r=g_strjoinv(value,parts); g_strfreev(parts); return r;
 }
@@ -364,7 +370,23 @@ done:
         if (cb && cb->ready) cb->ready(user,0,message);
     } else if (error_buffer && error_length) error_buffer[0]=0;
     if (timer) { g_source_destroy(timer); g_source_unref(timer); }
-    if (root) gupnp_root_device_set_available(root,FALSE);
+    s.stopping=TRUE;
+    if (root && gupnp_root_device_get_available(root)) {
+        /* GSSDP 1.6 queues three byebye announcement sets at 120ms/message.
+         * Disposing an unavailable group discards its remaining queue. Keep
+         * this context alive for a bounded 1.8s to send at least two complete
+         * sets for our six resources when the queue was idle. This is best
+         * effort (UDP and an existing announcement backlog may lose packets).
+         * No Rust actions/snapshots run during this drain. */
+        gupnp_root_device_set_available(root,FALSE);
+        GSource *drain=g_timeout_source_new(1800);
+        g_source_set_priority(drain,G_PRIORITY_HIGH);
+        g_source_set_callback(drain,drain_finished,s.loop,NULL);
+        g_source_attach(drain,main);
+        g_main_loop_run(s.loop);
+        g_source_destroy(drain);
+        g_source_unref(drain);
+    }
     g_clear_object(&s.av); g_clear_object(&s.rc); g_clear_object(&s.cm);
     g_clear_object(&root); g_clear_object(&doc); g_clear_object(&context); g_clear_object(&address);
     if (s.loop) g_main_loop_unref(s.loop);
