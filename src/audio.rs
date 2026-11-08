@@ -139,19 +139,39 @@ impl Audio {
         // Flush before teardown as well as afterwards, so messages produced by
         // the old stream cannot masquerade as events from a subsequent play.
         self.bus.set_flushing(true);
-        let result = self.pipeline.set_state(gst::State::Null);
-        // A concurrent failed upward transition can leave its failure return
-        // racing with teardown. The authoritative safety condition is settled
-        // NULL, never merely whether this particular set_state call returned OK.
-        let (settled, current, pending) = self.pipeline.state(gst::ClockTime::from_seconds(3));
+        // A failed upward transition can race the first downward request and
+        // leave the parent at READY. Reassert NULL, never a new input, within the
+        // original three-second shutdown budget. Only observed settled NULL is
+        // success; neither an OK return nor a stale failure alone is authoritative.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut observed = (gst::State::VoidPending, gst::State::VoidPending);
+        let mut stopped = false;
+        for _ in 0..3 {
+            let _ = self.pipeline.set_state(gst::State::Null);
+            let wait = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(std::time::Duration::from_secs(1));
+            let (_, current, pending) = self
+                .pipeline
+                .state(gst::ClockTime::from_nseconds(wait.as_nanos() as u64));
+            observed = (current, pending);
+            if current == gst::State::Null && pending == gst::State::VoidPending {
+                stopped = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
         self.bus.set_flushing(false);
         while self.bus.pop().is_some() {}
-        if current == gst::State::Null && pending == gst::State::VoidPending {
-            return Ok(());
+        if stopped {
+            Ok(())
+        } else {
+            bail!(
+                "Cannot stop playback: current={:?}, pending={:?}",
+                observed.0,
+                observed.1
+            )
         }
-        result.context("Cannot stop playback")?;
-        settled.context("Playback shutdown did not settle")?;
-        bail!("Playback shutdown did not reach NULL")
     }
 
     pub fn set_volume(&mut self, volume: u8) -> Result<()> {
@@ -373,15 +393,21 @@ mod tests {
     }
     #[test]
     fn failed_http_start_and_teardown_never_reuse_an_unsettled_pipeline() {
-        let mut audio = Audio::new("default", "default", "Master", true).unwrap();
-        for _ in 0..64 {
-            let _ = audio.play("http://127.0.0.1:1/refused");
-            std::thread::yield_now();
-            audio.stop().unwrap();
-            let (_, current, pending) = audio.pipeline.state(gst::ClockTime::ZERO);
-            assert_eq!(current, gst::State::Null);
-            assert_eq!(pending, gst::State::VoidPending);
-        }
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let mut audio = Audio::new("default", "default", "Master", true).unwrap();
+                    for _ in 0..64 {
+                        let _ = audio.play("http://127.0.0.1:1/refused");
+                        std::thread::yield_now();
+                        audio.stop().unwrap();
+                        let (_, current, pending) = audio.pipeline.state(gst::ClockTime::ZERO);
+                        assert_eq!(current, gst::State::Null);
+                        assert_eq!(pending, gst::State::VoidPending);
+                    }
+                });
+            }
+        });
     }
     #[test]
     fn full_buffer_reasserts_playing_after_an_asynchronous_pause() {
