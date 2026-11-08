@@ -174,6 +174,41 @@ impl Audio {
         Ok(())
     }
 
+    fn reconcile_state(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let target = if self.live || !self.buffering {
+            gst::State::Playing
+        } else {
+            gst::State::Paused
+        };
+        let (_, current, pending) = self.pipeline.state(gst::ClockTime::ZERO);
+        let settled_wrong = pending == gst::State::VoidPending && current != target;
+        let pending_wrong = pending != gst::State::VoidPending && pending != target;
+        if settled_wrong || pending_wrong {
+            if self.trace {
+                eprintln!(
+                    "gst reconcile target={target:?} current={current:?} pending={pending:?}"
+                );
+            }
+            let result = self
+                .pipeline
+                .set_state(target)
+                .context("GStreamer state transition failed")?;
+            if result == gst::StateChangeSuccess::NoPreroll {
+                self.live = true;
+                self.buffering = false;
+                if target != gst::State::Playing {
+                    self.pipeline
+                        .set_state(gst::State::Playing)
+                        .context("resume live source")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn poll(&mut self) -> Vec<Event> {
         let mut events = Vec::new();
         while let Some(message) = self.bus.pop() {
@@ -223,53 +258,17 @@ impl Audio {
                             self.live, self.buffering
                         );
                     }
-                    // A pipeline latency query also reflects a synchronous sink,
-                    // not just the source. It cannot classify HTTP radio as live.
-                    // Only NoPreroll state-change outcomes establish live mode.
-                    // If a known-live source was buffer-paused, undo that pause.
+                    // Coalesce a bus batch into the latest desired state.
+                    // Historical 0/100% messages must not churn asynchronous
+                    // pause/resume requests that can leave an older pause pending.
                     if self.live {
-                        let was_paused = std::mem::replace(&mut self.buffering, false);
-                        if was_paused
-                            && let Err(error) = self.pipeline.set_state(gst::State::Playing)
-                        {
-                            events.push(Event::Error(error.to_string()));
-                            let _ = self.stop();
-                            break;
-                        }
+                        self.buffering = false;
                     } else {
-                        events.push(Event::Buffering(percent));
-                        let pause = percent < 100;
-                        if pause {
+                        self.buffering = percent < 100;
+                        if self.buffering {
                             self.playing_reported = false;
                         }
-                        if self.buffering != pause {
-                            self.buffering = pause;
-                            let state = if pause {
-                                gst::State::Paused
-                            } else {
-                                gst::State::Playing
-                            };
-                            match self.pipeline.set_state(state) {
-                                Ok(gst::StateChangeSuccess::NoPreroll) => {
-                                    self.live = true;
-                                    self.buffering = false;
-                                    if pause
-                                        && let Err(error) =
-                                            self.pipeline.set_state(gst::State::Playing)
-                                    {
-                                        events.push(Event::Error(error.to_string()));
-                                        let _ = self.stop();
-                                        break;
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    events.push(Event::Error(error.to_string()));
-                                    let _ = self.stop();
-                                    break;
-                                }
-                            }
-                        }
+                        events.push(Event::Buffering(percent));
                     }
                 }
                 MessageView::StateChanged(state)
@@ -296,6 +295,10 @@ impl Audio {
                 }
                 _ => {}
             }
+        }
+        if let Err(error) = self.reconcile_state() {
+            events.push(Event::Error(error.to_string()));
+            let _ = self.stop();
         }
         // Bus messages describe past transitions. Confirm current AND pending
         // state after processing the batch before reporting output as playing.
@@ -365,6 +368,27 @@ mod tests {
         let (_, current, _) = audio.pipeline.state(gst::ClockTime::from_seconds(2));
         assert_eq!(current, gst::State::Playing);
         assert!(!audio.buffering);
+    }
+    #[test]
+    fn full_buffer_reasserts_playing_after_an_asynchronous_pause() {
+        gst::init().unwrap();
+        let mut audio = Audio::new("default", "default", "Master", true).unwrap();
+        audio.pipeline =
+            gst::parse::launch("audiotestsrc is-live=false ! fakesink sync=true").unwrap();
+        audio.bus = audio.pipeline.bus().unwrap();
+        audio.pipeline.set_state(gst::State::Paused).unwrap();
+        let (_, state, _) = audio.pipeline.state(gst::ClockTime::from_seconds(2));
+        assert_eq!(state, gst::State::Paused);
+        while audio.bus.pop().is_some() {}
+        audio.active = true;
+        audio.buffering = false; // latest BUFFERING(100) was already consumed
+        audio.poll();
+        let (_, state, pending) = audio.pipeline.state(gst::ClockTime::from_seconds(2));
+        assert_eq!(state, gst::State::Playing);
+        assert_eq!(pending, gst::State::VoidPending);
+        audio.stop().unwrap();
+        audio.poll();
+        assert_eq!(audio.pipeline.current_state(), gst::State::Null);
     }
     #[test]
     fn historical_playing_message_cannot_override_actual_paused_state() {

@@ -67,8 +67,10 @@ bursty network throughput; the network buffer also has a 256 KiB byte limit.
 HTTP radio is not automatically a GStreamer live source. Non-live buffering uses
 the standard pause/refill/resume policy; live status is derived from `NoPreroll`,
 not from a pipeline latency query (a synchronous sink affects that query too).
-Playing notifications confirm the current and pending pipeline state, rather than
-trusting a potentially historical bus message.
+Buffering messages are coalesced into a desired state and reconciled against
+current/pending pipeline state, including recovery from a late asynchronous pause.
+Playing notifications confirm the actual settled state rather than trusting a
+potentially historical bus message.
 
 Volume controls the configured ALSA `Master` directly, not software gain in the
 stream. Mixer/device names are configurable. Missing mixer means a clear failure,
