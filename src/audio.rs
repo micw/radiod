@@ -140,16 +140,18 @@ impl Audio {
         // the old stream cannot masquerade as events from a subsequent play.
         self.bus.set_flushing(true);
         let result = self.pipeline.set_state(gst::State::Null);
-        if result.is_ok() {
-            let (settled, _, _) = self.pipeline.state(gst::ClockTime::from_seconds(3));
-            self.bus.set_flushing(false);
-            settled.context("Playback shutdown did not settle")?;
-        } else {
-            self.bus.set_flushing(false);
-        }
+        // A concurrent failed upward transition can leave its failure return
+        // racing with teardown. The authoritative safety condition is settled
+        // NULL, never merely whether this particular set_state call returned OK.
+        let (settled, current, pending) = self.pipeline.state(gst::ClockTime::from_seconds(3));
+        self.bus.set_flushing(false);
         while self.bus.pop().is_some() {}
+        if current == gst::State::Null && pending == gst::State::VoidPending {
+            return Ok(());
+        }
         result.context("Cannot stop playback")?;
-        Ok(())
+        settled.context("Playback shutdown did not settle")?;
+        bail!("Playback shutdown did not reach NULL")
     }
 
     pub fn set_volume(&mut self, volume: u8) -> Result<()> {
@@ -368,6 +370,18 @@ mod tests {
         let (_, current, _) = audio.pipeline.state(gst::ClockTime::from_seconds(2));
         assert_eq!(current, gst::State::Playing);
         assert!(!audio.buffering);
+    }
+    #[test]
+    fn failed_http_start_and_teardown_never_reuse_an_unsettled_pipeline() {
+        let mut audio = Audio::new("default", "default", "Master", true).unwrap();
+        for _ in 0..64 {
+            let _ = audio.play("http://127.0.0.1:1/refused");
+            std::thread::yield_now();
+            audio.stop().unwrap();
+            let (_, current, pending) = audio.pipeline.state(gst::ClockTime::ZERO);
+            assert_eq!(current, gst::State::Null);
+            assert_eq!(pending, gst::State::VoidPending);
+        }
     }
     #[test]
     fn full_buffer_reasserts_playing_after_an_asynchronous_pause() {
