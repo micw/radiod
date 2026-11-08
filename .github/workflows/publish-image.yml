@@ -13,17 +13,19 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container: rust:1.99-bookworm
+    container: rust:1.99-trixie
     steps:
       - uses: actions/checkout@v4
       - name: Install native libraries and test plugins
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends pkg-config libgstreamer1.0-dev libasound2-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good python3
+          apt-get install -y --no-install-recommends pkg-config libgstreamer1.0-dev libasound2-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav python3
       - run: cargo test --locked
       - run: cargo build --locked
-      - run: target/debug/radiod --config radiod.yaml --check-config
+      - run: target/debug/radiod --config examples/radiod.yaml --check-config
       - run: python3 tests/smoke.py
+      - run: python3 tests/streaming.py
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
 
   publish:
     if: github.event_name != 'pull_request'

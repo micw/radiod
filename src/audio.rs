@@ -22,6 +22,9 @@ pub struct Audio {
     active: bool,
     live: bool,
     buffering: bool,
+    playing_reported: bool,
+    http_status: Option<u32>,
+    trace: bool,
 }
 
 impl Audio {
@@ -32,6 +35,7 @@ impl Audio {
         null_output: bool,
     ) -> Result<Self> {
         gst::init().context("GStreamer initialization failed")?;
+        eprintln!("audio engine: {}", gst::version_string());
         let pipeline = gst::ElementFactory::make("playbin")
             .build()
             .context("GStreamer playbin is unavailable")?;
@@ -52,7 +56,11 @@ impl Audio {
         pipeline.set_property("mute", false);
         // Radio playback must not create video windows or subtitle outputs.
         // GstPlayFlags: AUDIO (1 << 1), SOFT_VOLUME intentionally disabled.
-        pipeline.set_property_from_str("flags", "audio");
+        pipeline.set_property_from_str("flags", "audio+buffering");
+        // Parsed audio timestamps bound startup buffering independently of a
+        // source's burst download rate. Keep a small, explicit radio buffer.
+        pipeline.set_property("buffer-duration", 1_000_000_000i64);
+        pipeline.set_property("buffer-size", 262_144i32);
         pipeline.connect("source-setup", false, |values| {
             if let Ok(source) = values[1].get::<gst::Element>() {
                 // Units differ between the common HTTP sources. Only touch
@@ -97,6 +105,9 @@ impl Audio {
             active: false,
             live: false,
             buffering: false,
+            playing_reported: false,
+            http_status: None,
+            trace: std::env::var_os("RADIOD_TRACE_AUDIO").is_some(),
         })
     }
 
@@ -123,6 +134,8 @@ impl Audio {
         self.active = false;
         self.live = false;
         self.buffering = false;
+        self.playing_reported = false;
+        self.http_status = None;
         // Flush before teardown as well as afterwards, so messages produced by
         // the old stream cannot masquerade as events from a subsequent play.
         self.bus.set_flushing(true);
@@ -174,13 +187,19 @@ impl Audio {
                     // Expose typed diagnostics, never the unfiltered source text.
                     let e = error.error();
                     events.push(Event::Error(format!(
-                        "GStreamer error: resource={:?}, stream={:?}, core={:?}",
+                        "GStreamer error: resource={:?}, stream={:?}, core={:?}, http_status={:?}",
                         e.kind::<gst::ResourceError>(),
                         e.kind::<gst::StreamError>(),
-                        e.kind::<gst::CoreError>()
+                        e.kind::<gst::CoreError>(),
+                        self.http_status
                     )));
                     let _ = self.stop();
                     break;
+                }
+                MessageView::Element(element) => {
+                    if let Some(s) = element.structure().filter(|s| s.name() == "http-headers") {
+                        self.http_status = s.get::<u32>("http-status-code").ok();
+                    }
                 }
                 MessageView::Eos(..) => {
                     events.push(Event::Ended);
@@ -197,12 +216,17 @@ impl Audio {
                 }
                 MessageView::Buffering(buffering) => {
                     let percent = buffering.percent().clamp(0, 100) as u8;
-                    let mut latency = gst::query::Latency::new();
-                    if self.pipeline.query(&mut latency) && latency.result().0 {
-                        self.live = true;
+                    if self.trace {
+                        let (_, current, pending) = self.pipeline.state(gst::ClockTime::ZERO);
+                        eprintln!(
+                            "gst buffering={percent} live={} buffer_paused={} current={current:?} pending={pending:?}",
+                            self.live, self.buffering
+                        );
                     }
-                    // Live-ness can only become known after preroll. If a prior
-                    // buffering message paused the pipeline, explicitly undo it.
+                    // A pipeline latency query also reflects a synchronous sink,
+                    // not just the source. It cannot classify HTTP radio as live.
+                    // Only NoPreroll state-change outcomes establish live mode.
+                    // If a known-live source was buffer-paused, undo that pause.
                     if self.live {
                         let was_paused = std::mem::replace(&mut self.buffering, false);
                         if was_paused
@@ -215,6 +239,9 @@ impl Audio {
                     } else {
                         events.push(Event::Buffering(percent));
                         let pause = percent < 100;
+                        if pause {
+                            self.playing_reported = false;
+                        }
                         if self.buffering != pause {
                             self.buffering = pause;
                             let state = if pause {
@@ -244,24 +271,43 @@ impl Audio {
                             }
                         }
                     }
-                    if (self.live || percent == 100)
-                        && self.pipeline.current_state() == gst::State::Playing
-                    {
-                        events.push(Event::Playing);
-                    }
                 }
                 MessageView::StateChanged(state)
-                    if message
-                        .src()
-                        .is_some_and(|src| src == self.pipeline.upcast_ref::<gst::Object>())
-                        && state.current() == gst::State::Playing
-                        && !self.buffering =>
+                    if self.trace
+                        && message
+                            .src()
+                            .is_some_and(|s| s == self.pipeline.upcast_ref::<gst::Object>()) =>
                 {
-                    events.push(Event::Playing);
+                    eprintln!(
+                        "gst pipeline_transition old={:?} new={:?} pending={:?}",
+                        state.old(),
+                        state.current(),
+                        state.pending()
+                    );
+                }
+                MessageView::AsyncDone(..) if self.trace => {
+                    let (_, current, pending) = self.pipeline.state(gst::ClockTime::ZERO);
+                    eprintln!("gst async_done current={current:?} pending={pending:?}");
+                }
+                MessageView::Latency(..) => {
+                    if let Some(bin) = self.pipeline.downcast_ref::<gst::Bin>() {
+                        let _ = bin.recalculate_latency();
+                    }
                 }
                 _ => {}
             }
         }
+        // Bus messages describe past transitions. Confirm current AND pending
+        // state after processing the batch before reporting output as playing.
+        let (_, current, pending) = self.pipeline.state(gst::ClockTime::ZERO);
+        let playing = self.active
+            && !self.buffering
+            && current == gst::State::Playing
+            && pending == gst::State::VoidPending;
+        if playing && !self.playing_reported {
+            events.push(Event::Playing);
+        }
+        self.playing_reported = playing;
         events
     }
 }
@@ -277,7 +323,69 @@ impl Drop for Audio {
 mod tests {
     use super::*;
     #[test]
-    fn live_discovery_resumes_a_previously_buffer_paused_pipeline() {
+    fn nonlive_buffering_does_not_use_sink_latency_as_source_liveness() {
+        gst::init().unwrap();
+        let mut audio = Audio::new("default", "default", "Master", true).unwrap();
+        audio.pipeline =
+            gst::parse::launch("audiotestsrc is-live=false ! fakesink sync=true").unwrap();
+        audio.bus = audio.pipeline.bus().unwrap();
+        let start = audio.pipeline.set_state(gst::State::Playing).unwrap();
+        assert_ne!(start, gst::StateChangeSuccess::NoPreroll);
+        let (result, current, _) = audio.pipeline.state(gst::ClockTime::from_seconds(2));
+        result.unwrap();
+        assert_eq!(current, gst::State::Playing);
+        while audio.bus.pop().is_some() {}
+        audio.active = true;
+        audio
+            .bus
+            .post(
+                gst::message::Buffering::builder(10)
+                    .src(&audio.pipeline)
+                    .build(),
+            )
+            .unwrap();
+        let events = audio.poll();
+        assert!(
+            !audio.live,
+            "synchronous sink must not classify a non-live source as live"
+        );
+        assert!(audio.buffering);
+        assert!(!events.iter().any(|e| matches!(e, Event::Playing)));
+        let (_, current, _) = audio.pipeline.state(gst::ClockTime::from_seconds(2));
+        assert_eq!(current, gst::State::Paused);
+        audio
+            .bus
+            .post(
+                gst::message::Buffering::builder(100)
+                    .src(&audio.pipeline)
+                    .build(),
+            )
+            .unwrap();
+        audio.poll();
+        let (_, current, _) = audio.pipeline.state(gst::ClockTime::from_seconds(2));
+        assert_eq!(current, gst::State::Playing);
+        assert!(!audio.buffering);
+    }
+    #[test]
+    fn historical_playing_message_cannot_override_actual_paused_state() {
+        let mut audio = Audio::new("default", "default", "Master", true).unwrap();
+        audio.active = true;
+        audio
+            .bus
+            .post(
+                gst::message::StateChanged::builder(
+                    gst::State::Paused,
+                    gst::State::Playing,
+                    gst::State::VoidPending,
+                )
+                .src(&audio.pipeline)
+                .build(),
+            )
+            .unwrap();
+        assert!(!audio.poll().iter().any(|e| matches!(e, Event::Playing)));
+    }
+    #[test]
+    fn known_live_source_does_not_remain_buffer_paused() {
         gst::init().unwrap();
         let mut audio = Audio::new("default", "default", "Master", true).unwrap();
         audio.pipeline =

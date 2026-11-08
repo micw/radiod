@@ -1,0 +1,13 @@
+# Example only: no station catalogue is supplied with radiod.
+# Copy to a private radiod.yaml or provide --config /path/to/config.yaml.
+listen: 127.0.0.1:6600
+alsa_device: default
+mixer_device: default
+mixer_control: Master
+initial_volume: 25
+max_volume: 70
+retry_max_seconds: 30
+connect_timeout_seconds: 20
+autostart: false
+# Supply your own HTTP(S) streams, e.g. entries with name and url fields.
+stations: []

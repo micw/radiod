@@ -1,171 +1,174 @@
-# radiod — radio-only MPD replacement (first PoC)
+# radiod — radio-only MPD replacement
 
 Rust + embedded GStreamer, an MPD-compatible TCP endpoint and direct ALSA mixer
-volume. No MPD daemon, web UI, UPnP or phone-stream takeover in this version.
-**Not yet accepted with MPDroid or real ALSA hardware.**
+volume. No MPD daemon, music database, web UI, UPnP or phone-stream takeover in V1.
+The first client target is MPDroid; MAFA / M.A.L.P. are later interoperability tests.
 
-## Build and local test
+## Configuration belongs to the installation
 
-Native dependencies: Rust/Cargo, pkg-config, GStreamer >= 1.14 development files,
-ALSA development files. Runtime needs ALSA, GStreamer base/good/bad/ugly/libav
-plugins (actual codec support depends on installed plugins) and CA certificates.
-The checked-in lockfile is authoritative; see the Dockerfile for the build toolchain.
+**radiod ships no station catalogue or family/host configuration.** The tracked
+[example](examples/radiod.yaml) has an empty station list and generic audio devices.
+Copy it to your private `radiod.yaml` (gitignored), or mount your own configuration.
+The container image does not include any operating station list.
 
 ```sh
-cargo build --locked
-cargo test --locked
+cp examples/radiod.yaml radiod.yaml
+# Edit your devices, safe volume limits, listen address and station list.
 cargo run -- --config radiod.yaml --check-config
-# No sound card access, volume is simulated; useful for client/API tests:
-cargo run -- --config radiod.yaml --state state/test.json --null-output
-python3 tests/smoke.py
 ```
 
-For real playback, check the ALSA device and mixer configuration first, then omit
-`--null-output`. Do not run against the same card as an active MPD instance.
-Volume is set on the hardware mixer **before playback**. Start stopped by default.
-The supplied 25% / maximum 70% are conservative software limits, **not a guarantee
-of safe acoustic output**. Verify the device and actual hardware gain before a
-listening test. No mixer means startup fails; there is no software-volume fallback.
-The example uses the previously identified `Generic_1` card ID; verify it on the
-actual host instead of assuming that either that ID or numeric card 1 is stable.
+Add your own stations using `name` and an HTTP(S) `url`, for example:
 
-## Configuration
+```yaml
+stations:
+  - name: My station
+    url: https://radio.example.org/live
+```
 
-[radiod.yaml](radiod.yaml) migrates the existing MPD chart's station list.
-The duplicate “Antenne Bayern Lounge” entry is consolidated to the direct
-`s5-webradio.antenne.de` URL, leaving 16 stations. Alternate URLs per station are
-not implemented in V1; internal MPD IDs still need no user configuration.
-Each station needs only `name` and an HTTP(S) `url`. URLs must be unique; names
-need not be. The list order is the initial queue order. Limits: 1 MiB config, 1024 stations,
-256 bytes per name, 4096 bytes per URL, timeout settings 1–3600 seconds.
-Internal MPD song IDs are
-allocated automatically and preserved across reloads for unchanged URLs.
+That reserved example domain is documentation, not a working station. URLs must
+be unique; display names need not be. No manually assigned IDs: internal MPD IDs
+are allocated automatically and preserved on reload for unchanged URLs. The list
+order is the initial queue order. Alternate URLs per station are not implemented.
+Limits: 1 MiB configuration, 1024 stations, 256 bytes per name, 4096 bytes per URL,
+and timeout settings between 1 and 3600 seconds.
 
-The config path is reread every second, following the path afresh: atomic file
-replacement and Kubernetes ConfigMap symlink swaps are detected. No ConfigMap
-`subPath` mount: Kubernetes does not propagate updates to that type of mount.
-Kubernetes itself may take time to project a changed ConfigMap.
+### Live reload and persistence
 
-- Invalid YAML/unknown fields/invalid values: retain the last accepted config,
-  log the rejection. On invalid initial configuration, fail startup.
-- Rename or reorder: no stream restart. Changed list resets the mutable MPD queue
-  to configured order, preserving the selected URL if still present.
-- Active URL removed (including a URL edit): stop, never pick another station.
-- Mixer/output device or listen address changes require process restart and cause
-  the entire live reload to be rejected. Retry settings and volume ceiling reload.
-- Persistent JSON state stores selected URL, volume and desired playing flag.
+The configuration path is reread every second, following it afresh. Atomic file
+replacement and Kubernetes ConfigMap symlink swaps are detected. Do not mount an
+updating ConfigMap using `subPath`: Kubernetes does not propagate updates there.
+Projection of an updated ConfigMap can itself take time.
+
+- Invalid configuration retains the last accepted config and logs a rejection;
+  an invalid initial config fails startup.
+- Rename/reorder does not restart audio. A changed list resets the mutable MPD
+  queue to configured order and preserves the selected URL if still present.
+- Removing/editing the active URL stops playback; never select another station.
+- Listen address and audio/mixer devices require restart. Retry settings and the
+  volume ceiling can reload.
+- Persistent JSON stores selected URL, volume and desired playing intent.
   Default `autostart: false` loads selection/volume but remains stopped.
-  `autostart: true` resumes only if the saved desired state was playing.
-- Pause disconnects a live stream and retains its station; resume reconnects.
-  There is no timeshift.
+  Opt-in `autostart: true` resumes a saved playing station only if it still exists.
+- Pause disconnects a live stream and keeps its station; resume reconnects.
+  No timeshift or persistence of temporary phone sessions.
 
-`listen` defaults to `127.0.0.1:6600`. For the tablet, explicitly configure a LAN
-binding (or `0.0.0.0:6600` inside an isolated container) and restrict access to the
-trusted home network. This PoC has **no authentication or TLS**; do not publish it
-to the Internet. Only configured stream URLs can be added through MPD.
+The default bind is `127.0.0.1:6600`. To use a tablet, explicitly bind a reachable
+LAN address (or `0.0.0.0` inside a restricted container). **No authentication/TLS**
+is implemented. Restrict the MPD port to a trusted network; never expose it publicly.
+Only configured URLs can be added through MPD.
 
-## Reconnect policy
+## Playback and hardware volume
 
-Network/decoder errors and unexpected live-stream EOS reconnect **the same selected
-station indefinitely**. Delays: 1, 2, 4, 8, 16, 30 seconds, then every 30 seconds.
-`retry_max_seconds` changes the cap, not a total retry deadline. Reset the backoff
-after 30 seconds of stable playback. Connection attempts have a finite timeout.
-Stop cancels retries; explicit station selection starts a fresh attempt immediately.
-The old GStreamer pipeline is stopped and bus events flushed before a new source.
+GStreamer performs URL input, decoding, parsed-audio buffering and ALSA output.
+A small explicit one-second target buffer avoids guessing startup duration from
+bursty network throughput; the network buffer also has a 256 KiB byte limit.
+HTTP radio is not automatically a GStreamer live source. Non-live buffering uses
+the standard pause/refill/resume policy; live status is derived from `NoPreroll`,
+not from a pipeline latency query (a synchronous sink affects that query too).
+Playing notifications confirm the current and pending pipeline state, rather than
+trusting a potentially historical bus message.
 
-MPD standard state is `play` while buffering and `stop` while reconnecting (MPD
-has no exact matching states). Desired playback intent remains active during retry.
-A standard `error` field reports failures. Additional `radiod_state`, `radiod_retry`
-and `radiod_error` fields expose more detail; MPDroid may not display extensions.
-Upstream error/debug strings are not exposed because they can contain URL tokens.
-Persistence failures are reported separately as `radiod_persistence_error`; they
-never cause a healthy audio stream to stop. Reload remains accepted in this case,
-but changed state may be lost on restart until persistence works again.
+Volume controls the configured ALSA `Master` directly, not software gain in the
+stream. Mixer/device names are configurable. Missing mixer means a clear failure,
+not silent software fallback. Set a safe hardware level **before** playback.
+The example's 25% start and 70% maximum are application limits, **not a guarantee
+of safe acoustic output**. Verify actual card/control/gain before a listening test.
+Do not let MPD and radiod own the same sound card simultaneously.
 
-## MPD scope and acceptance
+Network/decoder failures and unexpected live-stream EOS retry the same selected
+station indefinitely: 1, 2, 4, 8, 16, 30 seconds, then every 30 seconds. The cap is
+configurable, not a total retry deadline. Reset backoff after 30 seconds of stable
+playback. Stop cancels retries; explicit selection starts a fresh attempt.
+Connection/buffering stalls have a finite watchdog. Switching sources stops the
+old pipeline and flushes its bus before reuse.
 
-First target: **MPDroid**, tested by the user. MAFA / M.A.L.P. are later candidates.
+MPD's standard state is `play` while buffering, `stop` while reconnecting. Diagnose
+using `radiod_state`, `radiod_retry` and `radiod_error`; standard `error` is emitted
+as well. Safe typed errors include HTTP status when available, without raw URL or
+upstream debug text. Logs include actual playback/buffering/retry transitions.
+`radiod_persistence_error` is separate: a disk error must not stop healthy audio.
+
+## Native runtime compatibility
+
+The supported image uses Debian Trixie/GStreamer 1.26 and **libsoup 3.8.0**.
+Some HTTP/2 redirects fail in older libsoup releases, reproducing identically in
+radiod and direct `gst-launch`; this is not an AAC decoder or sender-specific
+buffering rule. See the [upstream report](https://gitlab.gnome.org/GNOME/libsoup/-/issues/464)
+and [GStreamer discussion](https://discourse.gstreamer.org/t/should-redirects-work-for-http-2-streams/4930).
+Updating only the distribution base to libsoup 3.6 did not resolve the reproduced
+failure; using the unmodified 3.8.0 library did. No fixed CDN edge URL or blanket
+TLS-verification bypass is used.
+
+The Dockerfile downloads the pinned upstream release with SHA-256 verification,
+builds it in a separate stage and verifies which library the release tests load.
+Its exact source archive and license accompany the image under
+`/usr/share/radiod/third-party/`; build dependencies do not enter the runtime image.
+Keep this pin updated for upstream security releases. Native host builds need a
+compatible HTTP stack too; host success is not a substitute for image testing.
+
+## Build and tests
+
+Native build prerequisites: Rust/Cargo, pkg-config, GStreamer and ALSA development
+files. Runtime tests require GStreamer base/good/bad/libav plugins for AAC/ICY and
+WAV, plus Python 3. Follow the Dockerfile for the supported runtime/toolchain.
+
+```sh
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --locked
+python3 tests/smoke.py
+python3 tests/streaming.py
+docker build -t radiod:test .
+```
+
+Normal tests are **offline**: generated WAV and a small synthetic AAC fixture over
+loopback HTTP, including ICY titles, burst delivery, repeated starts/switches,
+reload, stop/retry and volume limits. No public station catalogue is embedded.
+`RADIOD_BINARY` can point the Python tests to a different binary. The Docker build
+runs both suites against its actual release binary/native runtime as a non-root
+user; a successful image build depends on those tests, not just the builder host.
+Null output simulates mixer volume and never accesses the actual sound device.
+These tests do not prove audible ALSA output or MPDroid interoperability.
+
+Live/network tests are opt-in against an explicit operating configuration:
+
+```sh
+python3 tests/live_stations.py --config /path/to/private.yaml \
+  --image radiod:test --rounds 2 --max-start-seconds 5 \
+  --output /path/to/private-report.json
+```
+
+This starts a separate null-output process/container, not the installed service.
+It measures actual `radiod_state=play` plus a stable-play hold for every station;
+invalid/unavailable URLs fail rather than being treated as decoder successes.
+Start-time budgets are acceptance checks, not a promise about an unavailable
+provider or an arbitrary Internet connection. The Docker test uses Linux host
+networking for its private loopback MPD port.
+
+## MPD scope
+
 Stored playlist `radio`, current queue/song, play/playid, pause/stop, explicit
-next/previous, volume, queue edits, command lists and idle are supported. This is
-not a full MPD music database or arbitrary Internet URL player. Duplicate queue
-entries are deliberately not supported (station IDs are unique). Nonzero
-repeat/random/single/consume options and disabling the sole output are explicitly
-rejected, rather than accepted without effect. `idle` conservatively announces
-multiple subsystems; statistics durations are currently placeholders. Connections
-are limited to 32, command lines to 8 KiB and command lists to 256 commands.
+next/previous, volume, queue edits, command lists and idle. No arbitrary URL player
+or general music database. Duplicate queue entries are not supported. Nonzero
+repeat/random/single/consume and disabling the sole output are rejected explicitly.
+Idle conservatively announces multiple subsystems; statistics durations remain
+placeholders. Limits: 32 connections, 8 KiB per command, 256 commands per list.
 
-Before replacing the old service, verify on the actual tablet:
+## Container operation and image builds
 
-1. Connect, show/load `radio`, select stations, play/stop and adjust volume.
-2. Observe station names, ICY titles and updates without reconnecting the client.
-3. Network loss preserves station, retries with backoff; Stop cancels retry.
-4. YAML rename/reorder/rejection/removal behavior and persisted restart state.
-5. Explicitly scheduled ALSA listening test with old MPD stopped, low initial gain,
-   and a rollback path. No Kubernetes deployment is implied by this implementation.
+Mount your own config at `/config/radiod.yaml` and writable state at `/state`.
+For client-only testing add `--null-output`. For published host ports the config
+must explicitly bind `0.0.0.0:6600` inside the container. The image runs as UID/GID
+65532; provide narrowly scoped sound-device access and matching permissions for
+ALSA. Do not solve permissions with blanket privileged access. A read-only root
+filesystem with a writable `/tmp` is supported; set `GST_REGISTRY` and
+`XDG_CACHE_HOME` there if needed.
 
-## Initial station probe
-
-Null-output probes reached playing for the ten non-404 stations, including the
-Ogg Radio Paradise stream and Radio Leipzig's AAC stream (despite its MP3-looking
-URL). Radio Leipzig exposed a live/buffering transition bug; after the fix it also
-reached playing. A regression test covers resuming a previously buffer-paused
-pipeline when its source is discovered to be live.
-
-A separate bounded HTTP GET probe returned 404 for the inherited KR New Classics,
-KR Klassik Meats Rock, KR Movie, KR Games, KR Lounge Beats and Charivari Lounge
-URLs. These six URLs remain in the configuration for explicit user review, not
-silently replaced. Network/provider behavior can change; these checks are not a
-listening or long-duration stability acceptance.
-
-## Container and Talos mw-home
-
-```sh
-docker build -t radiod:poc .
-# Offline-ish client test: no sound devices, simulated hardware volume
-# Supply a config with listen: 0.0.0.0:6600 for host port access.
-docker run --rm -p 127.0.0.1:6600:6600 \
-  -v "$PWD/radiod.yaml:/config/radiod.yaml:ro" \
-  --tmpfs /state:uid=65532,gid=65532 \
-  radiod:poc --config /config/radiod.yaml --state /state/state.json --null-output
-```
-
-The image runs as UID/GID 65532. Real ALSA needs deliberately granted device access
-and matching permissions, plus writable `/state`. Current host device permissions
-may prevent non-root access. Do not solve that with a blanket privileged namespace.
-Container audio playback requires an explicit device/security plan before rollout.
-
-Read-only cluster inspection confirmed `homehost` is linux/amd64, Talos 1.14.5;
-local talosctl is 1.14.4. This CLI has **no `image import` subcommand**. A local
-Docker image is not automatically available to the node's containerd.
-
-Preferred test distribution: push a unique tag to a reachable registry, then use
-that exact reference in the separately authorized test workload. GHCR is already
-used in the home repository, but radiod repository/push permissions are unverified.
-For example, after choosing the registry and authenticating:
-
-```sh
-docker tag radiod:poc ghcr.io/micw/radiod:test-UNIQUE
-docker push ghcr.io/micw/radiod:test-UNIQUE
-# Optional pre-pull (changes node image cache, does not create a Pod):
-talosctl \
-  --talosconfig /home/mwyraz/git/mw-kubernetes/env/mw-home/talos/clusterconfig/talosconfig \
-  -n 192.168.1.9 image --namespace cri pull ghcr.io/micw/radiod:test-UNIQUE
-```
-
-Build on amd64 or explicitly cross-build for linux/amd64. `docker buildx` is not
-assumed installed. A private registry requires appropriate pull credentials.
-Use unique tags or digests; `IfNotPresent` permits a pre-pulled image, whereas
-`Always` may still contact the registry. Node caches are node-specific and subject
-to garbage collection. A local LAN registry is another option but requires separate
-routing/TLS/Talos-registry planning; node `localhost` is not the build host.
-### GitHub image builds
-
-The GitHub Actions pipeline tests each master-branch push before publishing
-`ghcr.io/micw/radiod:master` and `ghcr.io/micw/radiod:sha-<full-commit>` for linux/amd64.
-Version tags `v*` also publish the corresponding image tag. Pull requests run tests
-without registry writes. The workflow uses the repository's `GITHUB_TOKEN`, just
-like the existing Dockernode build; no manually stored registry token is needed.
-For reproducible cluster tests use the commit tag or digest, not the moving `master`.
-Ensure the resulting GHCR package is publicly pullable or configure imagePullSecrets.
-Publication does not deploy anything. No node cache mutation, shutdown of MPD or
-Kubernetes deployment is part of this build step.
+GitHub Actions tests pushes to `master`, then publishes linux/amd64 images:
+`ghcr.io/micw/radiod:master` and `ghcr.io/micw/radiod:sha-<full-commit>`.
+Version tags `v*` publish their corresponding image tag; PRs only run tests.
+Publication uses the repository's `GITHUB_TOKEN`, not a stored personal token.
+Deploy a verified digest/commit tag for reproducibility, not only a moving tag.
+A local Docker image is not automatically in a Kubernetes node's containerd;
+use a reachable registry and deliberately configured pull policy/credentials.
+This repository's build pipeline does not itself modify a cluster.

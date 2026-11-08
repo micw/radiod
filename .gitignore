@@ -1,3 +1,7 @@
 /target/
 /state/
 /_intern_/
+/radiod.yaml
+/radiod.local.yaml
+__pycache__/
+*.pyc

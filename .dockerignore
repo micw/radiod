@@ -2,3 +2,5 @@ target
 state
 _intern_
 .git
+radiod.yaml
+radiod.local.yaml

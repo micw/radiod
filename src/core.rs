@@ -197,10 +197,22 @@ impl Core {
         let seconds = retry_delay(self.attempt, self.config.retry_max_seconds);
         self.attempt = self.attempt.saturating_add(1);
         self.retry = Some(Instant::now() + Duration::from_secs(seconds));
+        eprintln!(
+            "audio state=reconnecting station_id={:?} retry_seconds={} error={}",
+            self.current,
+            seconds,
+            self.error.as_deref().unwrap_or("unknown")
+        );
         self.changed();
     }
     fn buffering(&mut self, percent: u8) {
         if percent < 100 {
+            if self.state != "buffering" {
+                eprintln!(
+                    "audio state=buffering station_id={:?} percent={percent}",
+                    self.current
+                );
+            }
             self.state = "buffering".into();
             self.stable = None;
             self.started.get_or_insert_with(Instant::now);
@@ -213,6 +225,9 @@ impl Core {
             for e in self.audio.poll() {
                 match e {
                     Event::Playing => {
+                        if self.state != "play" {
+                            eprintln!("audio state=playing station_id={:?}", self.current);
+                        }
                         self.state = "play".into();
                         self.started = None;
                         self.stable.get_or_insert_with(Instant::now);

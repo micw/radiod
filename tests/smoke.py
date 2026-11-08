@@ -23,7 +23,7 @@ import wave
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = ROOT / "target/debug/radiod"
+BINARY = Path(os.environ.get("RADIOD_BINARY", ROOT / "target/debug/radiod"))
 DEADLINE = 0.0
 PAUSE = threading.Event()
 
