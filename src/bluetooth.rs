@@ -633,6 +633,10 @@ impl Core {
             self.error = None;
         } else if manual {
             self.bluetooth.manual = true;
+            if self.current != Some(song) {
+                self.set_metadata(None, None);
+                self.current = Some(song);
+            }
         }
         self.bluetooth.suspend = None;
         Ok(())
@@ -671,6 +675,21 @@ impl Core {
         self.bluetooth_play()
     }
     pub(super) fn bluetooth_play(&mut self) -> Result<()> {
+        let selectable = self
+            .bluetooth
+            .active
+            .and_then(|id| self.bluetooth.connections.get(&id))
+            .is_some_and(|c| {
+                !c.closed
+                    && c.snapshot
+                    && c.song.is_some_and(|song| {
+                        self.current == Some(song) && self.queue.contains(&song)
+                    })
+            });
+        anyhow::ensure!(
+            selectable,
+            "Bluetooth source hidden or unavailable; add and select it first"
+        );
         if let Some(c) = self
             .bluetooth
             .active

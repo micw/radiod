@@ -659,6 +659,63 @@ mod tests {
         assert_eq!(lines.next(&mut server).unwrap().unwrap(), "status");
     }
     #[test]
+    fn cleared_bluetooth_requires_explicit_add_and_reselection() {
+        use crate::{audio::Audio, config::Config};
+        use serde_json::json;
+        let mut config = Config::default();
+        config.bluetooth.enabled = true;
+        config.bluetooth.allowed_networks = vec!["127.0.0.0/8".parse().unwrap()];
+        let path = std::env::temp_dir().join(format!(
+            "radiod-mpd-clear-bt-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut c = Core::new(
+            config,
+            Audio::new("default", "default", "Master", true).unwrap(),
+            path,
+        )
+        .unwrap();
+        let connection = c.bluetooth_open("127.0.0.1".parse().unwrap()).unwrap();
+        c.bluetooth_message(connection,json!({"v":1,"type":"hello","seq":1,"device_id":"receiver","boot_id":"boot","firmware":"test","capabilities":{"play":true,"pause":true,"absolute_volume":false,"metadata":false},"codecs":["sbc"]})).unwrap();
+        let out = c.bluetooth_drain(connection);
+        let session = out[0]["control_session_id"].clone();
+        c.bluetooth_message(connection,json!({"v":1,"type":"state_snapshot","seq":2,"control_session_id":session,"boot_id":"boot","peer":{"connected":true,"peer_id":"phone","display_name":"Phone","name_pending":false},"bluetooth":{"link_state":"connected","audio_state":"suspended","player_state":"unknown"}})).unwrap();
+        let song = c
+            .songs
+            .iter()
+            .find(|s| s.source == SourceKind::Bluetooth)
+            .unwrap()
+            .clone();
+        execute(&mut c, &parse(&format!("playid {}", song.id)).unwrap()).unwrap();
+        execute(&mut c, &parse("clear").unwrap()).unwrap();
+        c.bluetooth_drain(connection);
+        let revision = c.revision;
+        assert!(execute(&mut c, &parse("play").unwrap()).is_err());
+        assert_eq!(c.revision, revision);
+        assert_eq!(c.current, None);
+        assert!(!c.desired);
+        assert_eq!(c.state, "stop");
+        assert!(
+            !c.bluetooth_drain(connection)
+                .iter()
+                .any(|m| m["type"] == "command" && m["action"] == "play")
+        );
+        execute(
+            &mut c,
+            &parse(&format!("add {}", song.station.url)).unwrap(),
+        )
+        .unwrap();
+        execute(&mut c, &parse(&format!("playid {}", song.id)).unwrap()).unwrap();
+        assert_eq!(c.current, Some(song.id));
+        assert!(c.desired);
+        assert!(
+            c.bluetooth_drain(connection)
+                .iter()
+                .any(|m| m["type"] == "command" && m["action"] == "play")
+        );
+    }
+    #[test]
     fn external_database_filter_and_deletion_are_safe() {
         use crate::{
             audio::Audio,
