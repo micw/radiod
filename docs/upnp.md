@@ -81,8 +81,10 @@ complete implementation of every optional UPnP AV operation.
   is required before it can start a new cast (the AriaCast startup sequence does so).
 - The temporary source appears in the active MPD queue/current song with its actual
   title/artist, but never in the configured `radio` playlist or persisted sessions.
-- Volume is global and capped. A takeover never applies source metadata as a volume
-  change or restores an older, possibly louder level. UPnP volume edits preserve
+- Volume is global, dB-aware and uses the full 0–100 protocol range, without an
+  additional `max_volume` cap. Both RenderingControl.SetVolume and MPD directly
+  control the hardware Master after the audio buffer. A takeover never applies
+  source metadata as a volume change or restores an older, possibly louder level. UPnP volume edits preserve
   mute; an explicit MPD volume edit unmutes. MPD reports effective volume zero while
   muted, whereas UPnP exposes the retained volume and separate mute state.
 
@@ -110,6 +112,21 @@ the Internet or treat it as an authenticated media service.
 - Raw tokenized source URLs and unrestricted native debug text are not logged.
 
 ## AriaCast compatibility target
+
+Enable **Settings -> Protocols -> DLNA / UPnP** before searching; discovery is
+opt-in in the reviewed sender. Select the renderer, not an AriaCast-native target.
+
+UPnP LAN capture uses a separate receiver profile: 200 ms upstream buffering,
+32 KiB network queue, 60 ms playsink PCM queue and 60 ms ALSA sink buffering.
+Radio retains its existing settings. The playsink PCM queue is independent of
+playbin's upstream buffer; reducing just the latter leaves another second queued.
+A clocked WAV/fakesink regression measures actual steady output-frame age, not
+just the first handoff or HTTP startup. These targets do not promise the exact
+same end-to-end delay on a phone/sound card or synchronized YouTube video.
+
+Receiver-volume commands take the direct RenderingControl -> Core -> ALSA path,
+without changing PCM, pausing playback or reopening the HTTP input. Changing the
+phone's source app/audio is different: already transmitted audio must drain.
 
 The reviewed Android sender uses a numeric phone IPv4 URL on TCP/8091, serving
 indefinite 48 kHz stereo S16LE WAV with unknown RIFF/data lengths. Its DIDL declares

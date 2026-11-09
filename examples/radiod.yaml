@@ -5,7 +5,6 @@ alsa_device: default
 mixer_device: default
 mixer_control: Master
 initial_volume: 25
-max_volume: 70
 retry_max_seconds: 30
 connect_timeout_seconds: 20
 autostart: false

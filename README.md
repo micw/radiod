@@ -62,8 +62,11 @@ Only configured URLs can be added through MPD.
 ## Playback and hardware volume
 
 GStreamer performs URL input, decoding, parsed-audio buffering and ALSA output.
-A small explicit one-second target buffer avoids guessing startup duration from
-bursty network throughput; the network buffer also has a 256 KiB byte limit.
+Internet radio keeps a one-second target buffer and 256 KiB byte limit, avoiding
+guesses based on bursty download throughput. UPnP LAN capture instead uses a
+200 ms target, 32 KiB byte limit and 60 ms ALSA sink buffer; returning to radio
+restores its normal buffering. These are receiver targets, not a guarantee of
+end-to-end Android/video synchronization.
 HTTP radio is not automatically a GStreamer live source. Non-live buffering uses
 the standard pause/refill/resume policy; live status is derived from `NoPreroll`,
 not from a pipeline latency query (a synchronous sink affects that query too).
@@ -74,9 +77,15 @@ potentially historical bus message.
 
 Volume controls the configured ALSA `Master` directly, not software gain in the
 stream. Mixer/device names are configurable. Missing mixer means a clear failure,
-not silent software fallback. Set a safe hardware level **before** playback.
-The example's 25% start and 70% maximum are application limits, **not a guarantee
-of safe acoustic output**. Verify actual card/control/gain before a listening test.
+not silent software fallback. Percentages use an MPD-compatible dB-aware hardware
+curve (raw hardware mapping only when valid dB metadata is unavailable). Volume
+always permits the full protocol range 0–100; there is no `max_volume` setting.
+Stored percentages are reused as-is, not migrated from the former raw curve.
+Before upgrading from that curve, lower the stored volume explicitly: the same
+number can otherwise become louder. The example's 25% initial value is **not a
+guarantee of safe acoustic output**. Verify actual card/control/gain before listening.
+UPnP RenderingControl and MPD volume commands both change the hardware directly,
+after the audio buffer; changing the phone's source audio is a different path.
 Do not let MPD and radiod own the same sound card simultaneously.
 
 Network/decoder failures and unexpected live-stream EOS retry the same selected

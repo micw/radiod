@@ -73,10 +73,7 @@ impl Core {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
-        let volume = saved
-            .volume
-            .unwrap_or(config.initial_volume)
-            .min(config.max_volume);
+        let volume = saved.volume.unwrap_or(config.initial_volume).min(100);
         audio.set_volume(if saved.muted { 0 } else { volume })?;
         let songs: Vec<_> = config
             .stations
@@ -231,7 +228,12 @@ impl Core {
             self.set_metadata(t, a);
         }
         self.error = None;
-        if let Err(e) = self.audio.play(&url) {
+        let result = if self.external.is_some() {
+            self.audio.play_external(&url)
+        } else {
+            self.audio.play(&url)
+        };
+        if let Err(e) = result {
             self.failed(e.to_string());
         }
         self.changed();
@@ -275,7 +277,7 @@ impl Core {
         result
     }
     pub fn set_volume(&mut self, v: u8) -> Result<()> {
-        let v = v.min(self.config.max_volume);
+        let v = v.min(100);
         self.audio.set_volume(v)?;
         self.volume = v;
         self.muted = false;
@@ -429,11 +431,7 @@ impl Core {
         let removed = self
             .current
             .is_some_and(|id| !songs.iter().any(|s| s.id == id));
-        let volume = self.volume.min(new.max_volume);
         // Hardware failures reject the config before changing stations/queue.
-        if volume != self.volume {
-            self.audio.set_volume(if self.muted { 0 } else { volume })?;
-        }
         if removed && let Err(e) = self.audio.stop() {
             let _ = self.audio.set_volume(self.effective_volume());
             return Err(e);
@@ -464,7 +462,6 @@ impl Core {
             e.radio.current = None;
             e.radio.desired = false;
         }
-        self.volume = volume;
         self.config = new;
         self.changed();
         // Persistence is reported separately; disk errors must not partly reject
@@ -493,25 +490,18 @@ impl Core {
         Ok(())
     }
     pub fn effective_volume(&self) -> u8 {
-        if self.muted {
-            0
-        } else {
-            self.volume.min(self.config.max_volume)
-        }
+        if self.muted { 0 } else { self.volume.min(100) }
     }
     pub fn set_mute(&mut self, muted: bool) -> Result<()> {
-        self.audio.set_volume(if muted {
-            0
-        } else {
-            self.volume.min(self.config.max_volume)
-        })?;
+        self.audio
+            .set_volume(if muted { 0 } else { self.volume.min(100) })?;
         self.muted = muted;
         self.changed();
         self.persist();
         Ok(())
     }
     pub fn upnp_set_volume(&mut self, v: u8) -> Result<()> {
-        let v = v.min(self.config.max_volume);
+        let v = v.min(100);
         self.audio.set_volume(if self.muted { 0 } else { v })?;
         self.volume = v;
         self.changed();
@@ -815,10 +805,36 @@ mod tests {
         assert_eq!(c.current, current);
     }
     #[test]
-    fn volume_is_clamped() {
+    fn volume_supports_full_protocol_range_and_clamps_invalid_values() {
         let mut c = fixture();
-        c.set_volume(100).unwrap();
-        assert_eq!(c.volume, 70);
+        for volume in 0..=100 {
+            c.set_volume(volume).unwrap();
+            assert_eq!(c.volume, volume);
+            assert_eq!(c.effective_volume(), volume);
+        }
+        c.set_volume(255).unwrap();
+        assert_eq!(c.volume, 100);
+        let mut new = c.config.clone();
+        new.initial_volume = 20;
+        c.reload(new).unwrap();
+        assert_eq!(c.volume, 100);
+        c.upnp_set_volume(255).unwrap();
+        assert_eq!(c.volume, 100);
+    }
+    #[test]
+    fn saved_volume_is_not_migrated_and_only_protocol_clamped() {
+        let c = fixture();
+        for (saved, expected) in [(20, 20), (100, 100), (255, 100)] {
+            std::fs::create_dir_all(c.path.parent().unwrap()).unwrap();
+            std::fs::write(&c.path, format!("{{\"volume\":{saved}}}")).unwrap();
+            let loaded = Core::new(
+                c.config.clone(),
+                Audio::new("default", "default", "Master", true).unwrap(),
+                c.path.clone(),
+            )
+            .unwrap();
+            assert_eq!(loaded.volume, expected);
+        }
     }
     #[test]
     fn persistence_failure_does_not_become_stream_failure() {
@@ -992,10 +1008,10 @@ mod tests {
         c.upnp_set_volume(255).unwrap();
         assert!(c.muted);
         assert_eq!(c.effective_volume(), 0);
-        assert_eq!(c.volume, c.config.max_volume);
+        assert_eq!(c.volume, 100);
         c.set_volume(255).unwrap();
         assert!(!c.muted);
-        assert_eq!(c.effective_volume(), c.config.max_volume);
+        assert_eq!(c.effective_volume(), 100);
         let mut new = c.config.clone();
         new.stations.reverse();
         new.stations[0].name = "Renamed".into();

@@ -1,6 +1,35 @@
-use alsa::mixer::{Mixer, SelemId};
+use crate::volume::{normalized_db, raw_volume};
+use alsa::{
+    Round,
+    mixer::{MilliBel, Mixer, SelemId},
+};
 use anyhow::{Context, Result, anyhow, bail};
 use gstreamer::{self as gst, prelude::*};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+fn configure_output_queue(element: &gst::Element, external: bool) {
+    if element.name() == "aqueue" && element.factory().is_some_and(|f| f.name() == "queue") {
+        // playsink has its own one-second PCM queue, independent of playbin's
+        // upstream buffer-duration. Leaving it unchanged hides another second
+        // behind a paused HTTP refill. Bound it only for LAN capture.
+        element.set_property(
+            "max-size-time",
+            if external {
+                60_000_000u64
+            } else {
+                1_000_000_000u64
+            },
+        );
+        element.set_property(
+            "max-size-bytes",
+            if external { 0u32 } else { 10_485_760u32 },
+        );
+        element.set_property("max-size-buffers", if external { 0u32 } else { 200u32 });
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -19,6 +48,7 @@ pub struct Audio {
     pipeline: gst::Element,
     bus: gst::Bus,
     mixer: Option<(Mixer, SelemId)>,
+    external_profile: Arc<AtomicBool>,
     active: bool,
     live: bool,
     buffering: bool,
@@ -97,11 +127,20 @@ impl Audio {
             }
             Some((mixer, id))
         };
+        let external_profile = Arc::new(AtomicBool::new(false));
+        let profile = external_profile.clone();
+        pipeline.connect("deep-element-added", false, move |values| {
+            if let Ok(element) = values[2].get::<gst::Element>() {
+                configure_output_queue(&element, profile.load(Ordering::Acquire));
+            }
+            None
+        });
         let bus = pipeline.bus().context("playbin has no bus")?;
         Ok(Self {
             pipeline,
             bus,
             mixer,
+            external_profile,
             active: false,
             live: false,
             buffering: false,
@@ -112,7 +151,43 @@ impl Audio {
     }
 
     pub fn play(&mut self, url: &str) -> Result<()> {
+        self.play_with_profile(url, false)
+    }
+
+    pub fn play_external(&mut self, url: &str) -> Result<()> {
+        self.play_with_profile(url, true)
+    }
+
+    fn configure_profile(&mut self, external: bool) {
+        self.external_profile.store(external, Ordering::Release);
+        if let Some(bin) = self.pipeline.downcast_ref::<gst::Bin>() {
+            let mut children = bin.iterate_recurse();
+            while let Ok(Some(element)) = children.next() {
+                configure_output_queue(&element, external);
+            }
+        }
+        // LAN capture needs responsive output, not the Internet-radio refill
+        // margin. Always restore the radio settings when leaving that input.
+        self.pipeline.set_property(
+            "buffer-duration",
+            if external {
+                200_000_000i64
+            } else {
+                1_000_000_000i64
+            },
+        );
+        self.pipeline
+            .set_property("buffer-size", if external { 32_768i32 } else { 262_144i32 });
+        let sink = self.pipeline.property::<gst::Element>("audio-sink");
+        if sink.find_property("buffer-time").is_some() {
+            sink.set_property("buffer-time", if external { 60_000i64 } else { 200_000i64 });
+            sink.set_property("latency-time", 10_000i64);
+        }
+    }
+
+    fn play_with_profile(&mut self, url: &str, external: bool) -> Result<()> {
         self.stop()?;
+        self.configure_profile(external);
         if url.trim().is_empty() {
             bail!("Playback URI must not be empty");
         }
@@ -183,7 +258,34 @@ impl Audio {
                 .find_selem(id)
                 .context("ALSA mixer control disappeared")?;
             let (min, max) = element.get_playback_volume_range();
-            let value = min + ((max - min) as f64 * f64::from(volume) / 100.0).round() as i64;
+            let fallback =
+                raw_volume(volume, min, max).context("Invalid ALSA playback volume range")?;
+            // Endpoints must be exact, including mute controls. Querying endpoint
+            // conversions checks ALSA's Result status, unlike the crate's dB
+            // range getter, which discards errors and can fabricate (0, 0).
+            // All conversions are read-only; complete them before any setter.
+            let value = if volume == 0 || volume == 100 || min == max {
+                fallback
+            } else {
+                let metadata = element.ask_playback_vol_db(min).and_then(|db_min| {
+                    element
+                        .ask_playback_vol_db(max)
+                        .map(|db_max| (db_min.0, db_max.0))
+                });
+                match metadata
+                    .ok()
+                    .and_then(|(lo, hi)| normalized_db(volume, lo, hi))
+                {
+                    Some(db) => element
+                        // MPD supports directed rounding. Choose ceil both for
+                        // centi-dB and the supported hardware step (not raw
+                        // interpolation); clamp even a surprising ALSA result.
+                        .ask_playback_db_vol(MilliBel(db), Round::Ceil)
+                        .context("Cannot convert ALSA playback dB to hardware volume")?
+                        .clamp(min, max),
+                    None => fallback,
+                }
+            };
             element
                 .set_playback_volume_all(value)
                 .context("Cannot set ALSA playback volume")?;
@@ -337,6 +439,10 @@ impl Audio {
     }
 }
 
+#[cfg(test)]
+#[path = "audio_latency_tests.rs"]
+mod latency_tests;
+
 impl Drop for Audio {
     fn drop(&mut self) {
         self.bus.set_flushing(true);
@@ -390,6 +496,38 @@ mod tests {
         let (_, current, _) = audio.pipeline.state(gst::ClockTime::from_seconds(2));
         assert_eq!(current, gst::State::Playing);
         assert!(!audio.buffering);
+    }
+    #[test]
+    fn external_profile_bounds_new_and_reused_output_queue_then_restores_radio() {
+        let mut audio = Audio::new("default", "default", "Master", true).unwrap();
+        audio.configure_profile(true);
+        let queue = gst::ElementFactory::make("queue")
+            .name("aqueue")
+            .build()
+            .unwrap();
+        audio
+            .pipeline
+            .downcast_ref::<gst::Bin>()
+            .unwrap()
+            .add(&queue)
+            .unwrap();
+        assert_eq!(queue.property::<u64>("max-size-time"), 60_000_000);
+        assert_eq!(
+            audio.pipeline.property::<i64>("buffer-duration"),
+            200_000_000
+        );
+        assert_eq!(audio.pipeline.property::<i32>("buffer-size"), 32_768);
+        audio.configure_profile(false);
+        assert_eq!(queue.property::<u64>("max-size-time"), 1_000_000_000);
+        assert_eq!(queue.property::<u32>("max-size-bytes"), 10_485_760);
+        assert_eq!(queue.property::<u32>("max-size-buffers"), 200);
+        assert_eq!(
+            audio.pipeline.property::<i64>("buffer-duration"),
+            1_000_000_000
+        );
+        assert_eq!(audio.pipeline.property::<i32>("buffer-size"), 262_144);
+        audio.configure_profile(true);
+        assert_eq!(queue.property::<u64>("max-size-time"), 60_000_000);
     }
     #[test]
     fn failed_http_start_and_teardown_never_reuse_an_unsettled_pipeline() {

@@ -3,6 +3,7 @@ mod config;
 mod core;
 mod mpd;
 mod upnp;
+mod volume;
 use anyhow::{Context, Result};
 use std::{
     path::PathBuf,

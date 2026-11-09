@@ -44,7 +44,6 @@ pub struct Config {
     pub mixer_device: String,
     pub mixer_control: String,
     pub initial_volume: u8,
-    pub max_volume: u8,
     pub retry_max_seconds: u64,
     pub connect_timeout_seconds: u64,
     pub autostart: bool,
@@ -59,7 +58,6 @@ impl Default for Config {
             mixer_device: "default".into(),
             mixer_control: "Master".into(),
             initial_volume: 25,
-            max_volume: 70,
             retry_max_seconds: 30,
             connect_timeout_seconds: 20,
             autostart: false,
@@ -74,8 +72,8 @@ impl Config {
         if c.stations.len() > 1024 {
             bail!("at most 1024 stations allowed");
         }
-        if c.initial_volume > c.max_volume || c.max_volume > 100 {
-            bail!("volume must satisfy initial <= maximum <= 100");
+        if c.initial_volume > 100 {
+            bail!("initial_volume must be between 0 and 100");
         }
         if !(1..=3600).contains(&c.retry_max_seconds)
             || !(1..=3600).contains(&c.connect_timeout_seconds)
@@ -150,7 +148,7 @@ mod tests {
     #[test]
     fn defaults_are_safe() {
         let c = Config::default();
-        assert!(c.initial_volume <= c.max_volume);
+        assert!(c.initial_volume <= 100);
         assert!(!c.autostart);
     }
     #[test]
@@ -161,7 +159,9 @@ mod tests {
     #[test]
     fn unreasonable_timeouts_and_volume_rejected() {
         assert!(Config::from_bytes(b"retry_max_seconds: 18446744073709551615").is_err());
-        assert!(Config::from_bytes(b"max_volume: 101").is_err());
+        assert!(Config::from_bytes(b"initial_volume: 101").is_err());
+        assert!(Config::from_bytes(b"initial_volume: -1").is_err());
+        assert!(Config::from_bytes(b"initial_volume: 100").is_ok());
         assert!(Config::from_bytes(b"connect_timeout_seconds: 0").is_err());
     }
     #[test]
@@ -182,5 +182,6 @@ mod tests {
     #[test]
     fn unknown_fields_rejected() {
         assert!(serde_yaml::from_str::<Config>("typo: 1").is_err());
+        assert!(Config::from_bytes(b"max_volume: 70").is_err());
     }
 }

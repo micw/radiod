@@ -157,9 +157,9 @@ def main():
                 reservation.bind(("127.0.0.1", 0))
                 port = reservation.getsockname()[1]
 
-            def replace(stations, maximum=45, invalid=False):
+            def replace(stations, invalid=False):
                 text = "listen: " + json.dumps("127.0.0.1:%d" % port) + "\n"
-                text += "initial_volume: 20\nmax_volume: %d\nretry_max_seconds: 1\nconnect_timeout_seconds: 2\nautostart: false\n" % maximum
+                text += "initial_volume: 20\nretry_max_seconds: 1\nconnect_timeout_seconds: 2\nautostart: false\n"
                 text += "stations:\n"
                 for name, url in stations:
                     text += "  - name: %s\n    url: %s\n" % (json.dumps(name), json.dumps(url))
@@ -194,7 +194,7 @@ def main():
                     tone_id = by_url[base + "/tone.wav"]["Id"]
                     failure_id = by_url[base + "/failure"]["Id"]
                     client.command("setvol 100")
-                    check(client.status().get("volume") == "45", "max volume not clamped")
+                    check(client.status().get("volume") == "100", "full protocol volume range unavailable")
                     client.command("play " + by_url[base + "/tone.wav"]["Pos"])
                     eventually(lambda: count("/tone.wav") >= 2, "WAV EOS did not trigger retry", 5)
                     check(client.status().get("songid") == tone_id, "EOS changed current ID")
@@ -207,16 +207,16 @@ def main():
                     client = MPD(port)
                     check(client.status().get("songid") == failure_id, "client reconnect lost current ID")
                     renamed = [("Renamed failure", base + "/failure"), ("Renamed tone", base + "/tone.wav")]
-                    replace(renamed, maximum=30)
+                    replace(renamed)
                     def reloaded():
                         rows = songs(client.command("playlistinfo"))
-                        return len(rows) == 2 and rows[0].get("Id") == failure_id and rows[0].get("Name") == "Renamed failure" and rows[1].get("Id") == tone_id and client.status().get("volume") == "30"
-                    eventually(reloaded, "atomic rename/reorder/max-volume reload failed")
+                        return len(rows) == 2 and rows[0].get("Id") == failure_id and rows[0].get("Name") == "Renamed failure" and rows[1].get("Id") == tone_id and client.status().get("volume") == "100"
+                    eventually(reloaded, "atomic rename/reorder reload changed volume or failed")
                     replace([("Invalid replacement", base + "/other")], invalid=True)
                     # Wait for the actual watcher rejection, not an arbitrary sleep.
                     eventually(lambda: "configuration rejected" in log_path.read_text(errors="replace"), "invalid configuration was not rejected")
                     check(reloaded(), "invalid configuration replaced the previous playlist")
-                    replace([("Renamed tone", base + "/tone.wav")], maximum=30)
+                    replace([("Renamed tone", base + "/tone.wav")])
                     eventually(lambda: len(songs(client.command("playlistinfo"))) == 1 and client.status().get("state") == "stop", "removing active URL did not stop playback")
                     # Standard MPD command lists must preserve response framing.
                     client.send("command_list_ok_begin\nstatus\nplaylistinfo\ncommand_list_end")

@@ -256,7 +256,7 @@ def main():
                     HTTP_PORT = http_reservation.getsockname()[1]
                 config = directory / 'radio.yaml'
                 state = directory / 'state.json'
-                config.write_text('listen: "127.0.0.1:%d"\ninitial_volume: 20\nmax_volume: 70\n'
+                config.write_text('listen: "127.0.0.1:%d"\ninitial_volume: 20\n'
                                   'autostart: false\nconnect_timeout_seconds: 5\nretry_max_seconds: 1\n'
                                   f'upnp:\n  enabled: true\n  interface: lo\n  bind_address: 127.0.0.1\n  port: {HTTP_PORT}\n'
                                   '  friendly_name: "Offline UPnP & renderer"\n'
@@ -391,6 +391,18 @@ def main():
                 with condition:
                     foreign_gets = requests.get('/foreign.wav', 0)
                 check(foreign_gets == 1, 'initial WAV playback issued unexpected HTTP GETs')
+                # Receiver volume is control-plane/hardware state, not PCM queued
+                # before the stream buffer. It must not reopen or pause audio.
+                retained_volume = soap(RC, 'GetVolume', {'InstanceID': 0, 'Channel': 'Master'})['CurrentVolume']
+                changed_at = time.monotonic()
+                soap(RC, 'SetVolume', {'InstanceID': 0, 'Channel': 'Master', 'DesiredVolume': retained_volume})
+                volume_roundtrip = time.monotonic() - changed_at
+                check(volume_roundtrip < .5, 'receiver volume waited behind audio buffer: %.3fs' % volume_roundtrip)
+                check(state_is('upnp', 'play', s['songid']) and
+                      client.fields('status')['radiod_session'] == s['radiod_session'],
+                      'direct volume control restarted or paused source')
+                with condition:
+                    check(requests.get('/foreign.wav', 0) == foreign_gets, 'direct volume control reopened source')
                 updated_title = 'Live metadata update'
                 updated = metadata.replace(escape(title), updated_title)
                 av('SetAVTransportURI', CurrentURI=base + '/foreign.wav', CurrentURIMetaData=updated)
@@ -432,13 +444,13 @@ def main():
                 av('Stop')
                 eventually(lambda: state_is('radio', 'stop'), 'stopped radio resumed unexpectedly')
 
-                # Shared volume cap/mute, including actual GENA changes.
+                # Shared full-range volume/mute, including actual GENA changes.
                 marker = len(notifications)
-                rc('SetVolume', DesiredVolume=99)
-                check(rc('GetVolume')['CurrentVolume'] == '70' and client.fields('status')['volume'] == '70', 'volume cap not shared')
-                notify('/notify/rc', 'Volume', '70', marker)
+                rc('SetVolume', DesiredVolume=100)
+                check(rc('GetVolume')['CurrentVolume'] == '100' and client.fields('status')['volume'] == '100', 'full-range volume not shared')
+                notify('/notify/rc', 'Volume', '100', marker)
                 rc('SetMute', DesiredMute=1)
-                check(rc('GetMute')['CurrentMute'] in ('1', 'true') and rc('GetVolume')['CurrentVolume'] == '70' and
+                check(rc('GetMute')['CurrentMute'] in ('1', 'true') and rc('GetVolume')['CurrentVolume'] == '100' and
                       client.fields('status')['volume'] == '0', 'mute lost retained volume')
                 client.command('setvol 31')
                 check(rc('GetVolume')['CurrentVolume'] == '31' and rc('GetMute')['CurrentMute'] in ('0', 'false'),

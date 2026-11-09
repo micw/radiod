@@ -194,7 +194,7 @@ def main():
                 config = directory / "radio.yaml"
                 config.write_text(
                     "listen: " + json.dumps("127.0.0.1:%d" % port) + "\n"
-                    "initial_volume: 20\nmax_volume: 45\nretry_max_seconds: 1\n"
+                    "initial_volume: 20\nretry_max_seconds: 1\n"
                     "connect_timeout_seconds: 5\nautostart: false\nstations:\n" +
                     "".join("  - name: %s\n    url: %s\n" % (json.dumps(title), json.dumps(base + path))
                             for path, title in TITLES.items()), encoding="utf-8")
