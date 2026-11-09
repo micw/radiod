@@ -1,5 +1,5 @@
 //! Small, deliberately unauthenticated MPD compatibility endpoint for configured radios.
-use crate::core::Core;
+use crate::core::{Core, SourceKind};
 use anyhow::Result;
 use std::{
     io::{self, Read, Write},
@@ -381,7 +381,7 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
             if cmd == "lsinfo" {
                 out.push_str("playlist: radio\nLast-Modified: 1970-01-01T00:00:00Z\n");
             }
-            for s in c.songs.iter().filter(|s| !s.temporary) {
+            for s in c.songs.iter().filter(|s| s.source != SourceKind::Upnp) {
                 out.push_str(&song(c, s.id, None, cmd != "listall"));
             }
         }
@@ -412,6 +412,8 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
             }
             if let Some(session) = c.external_session_id() {
                 out.push_str(&format!("radiod_source: upnp\nradiod_session: {session}\n"));
+            } else if c.bluetooth_selected() {
+                out.push_str("radiod_source: bluetooth\n");
             } else {
                 out.push_str("radiod_source: radio\n");
             }
@@ -427,7 +429,7 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
                 out.push_str("radiod_persistence_error: Unable to save playback state\n");
             }
         }
-        "stats" => out = format!("artists: 0\nalbums: 0\nsongs: {}\nuptime: 0\ndb_playtime: 0\ndb_update: 0\nplaytime: 0\n", c.radio_song_ids().len()),
+        "stats" => out = format!("artists: 0\nalbums: 0\nsongs: {}\nuptime: 0\ndb_playtime: 0\ndb_update: 0\nplaytime: 0\n", c.songs.iter().filter(|s| s.source != SourceKind::Upnp).count()),
         "currentsong" => {
             if let Some(id) = c.current {
                 out = song(c, id, c.queue.iter().position(|v| *v == id), true);
@@ -486,7 +488,7 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
             queue_changed = true;
         }
         "add" | "addid" => {
-            let id = c.songs.iter().find(|s| !s.temporary && s.station.url == p[0]).map(|s| s.id).ok_or((50, "only configured URLs are allowed".into()))?;
+            let id = c.songs.iter().find(|s| s.source != SourceKind::Upnp && s.station.url == p[0]).map(|s| s.id).ok_or((50, "only configured URLs are allowed".into()))?;
             let pos = if p.len() == 2 { number(&p[1])? } else { c.queue.len() };
             if pos > c.queue.len() {
                 return Err((50, "bad position".into()));
@@ -569,7 +571,7 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
         }
         "stop" => c.stop(false).map_err(|e| (52, e.to_string()))?,
         "next" | "previous" => {
-            let ids: Vec<_> = c.queue.iter().copied().filter(|id| c.song(*id).is_some_and(|s| !s.temporary)).collect();
+            let ids: Vec<_> = c.queue.iter().copied().filter(|id| c.song(*id).is_some_and(|s| s.source != SourceKind::Upnp)).collect();
             if !ids.is_empty() {
                 let pos = c.current.and_then(|id| ids.iter().position(|v| *v == id));
                 let next = match pos { Some(pos) if cmd == "next" => (pos + 1) % ids.len(), Some(pos) => (pos + ids.len() - 1) % ids.len(), None if cmd == "next" => 0, None => ids.len()-1 };

@@ -1,9 +1,13 @@
-# radiod — radio-only MPD replacement
+# radiod — MPD-compatible radio and live receiver
 
 Rust + embedded GStreamer, an MPD-compatible TCP endpoint and direct ALSA mixer
 volume. No MPD daemon, music database or web UI. An optional GUPnP-based audio
 MediaRenderer PoC supports temporary LAN streams and controlled radio return;
 see [UPnP setup, policy and limitations](docs/upnp.md). It is disabled by default.
+An optional [ESP32 Bluetooth receiver input](docs/bluetooth.md) adds WebSocket
+control, SBC/AAC RTP decoding and live phone entries in MPD, with a static 500 ms
+Bluetooth jitter buffer. It does not require UPnP, multicast or a separate LAN IP.
+Authentication is out of scope for this trusted-LAN input; it is disabled by default.
 The first client target is MPDroid; MAFA / M.A.L.P. are later interoperability tests.
 
 ## Configuration belongs to the installation
@@ -141,6 +145,7 @@ python3 tests/smoke.py
 python3 tests/streaming.py
 python3 tests/metadata.py
 python3 tests/upnp.py
+python3 tests/receiver.py
 docker build -t radiod:test .
 ```
 

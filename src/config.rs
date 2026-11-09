@@ -1,7 +1,40 @@
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, net::Ipv4Addr, path::Path};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::Path,
+};
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BluetoothConfig {
+    pub enabled: bool,
+    pub listen: SocketAddr,
+    pub rtp_listen: SocketAddr,
+    pub advertise_address: Option<IpAddr>,
+    pub allowed_networks: Vec<IpNet>,
+    pub allowed_devices: Vec<String>,
+    pub buffer_ms: u32,
+    pub lease_ms: u64,
+    pub suspend_ms: u64,
+}
+impl Default for BluetoothConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:8092".parse().unwrap(),
+            rtp_listen: "0.0.0.0:5004".parse().unwrap(),
+            advertise_address: None,
+            allowed_networks: Vec::new(),
+            allowed_devices: Vec::new(),
+            buffer_ms: 500,
+            lease_ms: 6000,
+            suspend_ms: 2500,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -49,6 +82,7 @@ pub struct Config {
     pub autostart: bool,
     pub stations: Vec<Station>,
     pub upnp: UpnpConfig,
+    pub bluetooth: BluetoothConfig,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -63,6 +97,7 @@ impl Default for Config {
             autostart: false,
             stations: vec![],
             upnp: UpnpConfig::default(),
+            bluetooth: BluetoothConfig::default(),
         }
     }
 }
@@ -114,6 +149,48 @@ impl Config {
                 bail!("UPnP timeouts must be between 1 and 3600 seconds");
             }
         }
+        if c.bluetooth.enabled {
+            let b = &c.bluetooth;
+            if b.listen.port() == 0 || b.rtp_listen.port() == 0 {
+                bail!("Bluetooth control and RTP require nonzero ports");
+            }
+            if b.listen.is_ipv4() != b.rtp_listen.is_ipv4()
+                || b.advertise_address
+                    .is_some_and(|a| a.is_ipv4() != b.rtp_listen.is_ipv4())
+            {
+                bail!(
+                    "Bluetooth control, RTP and advertised addresses must use the same IP family"
+                );
+            }
+            if b.allowed_networks.is_empty() {
+                bail!("Bluetooth requires explicit allowed_networks (not authentication)");
+            }
+            if b.advertise_address.is_none_or(|a| {
+                a.is_unspecified() || a.is_multicast() || a == IpAddr::V4(Ipv4Addr::BROADCAST)
+            }) {
+                bail!("Bluetooth requires a reachable unicast advertise_address");
+            }
+            if !(50..=5000).contains(&b.buffer_ms)
+                || !(1000..=60000).contains(&b.lease_ms)
+                || b.suspend_ms > 10000
+            {
+                bail!("invalid Bluetooth buffer or lease/suspend interval");
+            }
+            if b.allowed_devices.len() > 32
+                || b.allowed_devices.iter().any(|d| {
+                    d.is_empty()
+                        || d.len() > 64
+                        || !d
+                            .bytes()
+                            .all(|v| v.is_ascii_alphanumeric() || b"_.-".contains(&v))
+                })
+            {
+                bail!("invalid Bluetooth allowed_devices");
+            }
+            if c.listen.parse::<SocketAddr>().ok() == Some(b.listen) {
+                bail!("MPD and Bluetooth control listeners must differ");
+            }
+        }
         let mut urls = HashSet::new();
         for s in &c.stations {
             if s.name.trim().is_empty()
@@ -163,6 +240,25 @@ mod tests {
         assert!(Config::from_bytes(b"initial_volume: -1").is_err());
         assert!(Config::from_bytes(b"initial_volume: 100").is_ok());
         assert!(Config::from_bytes(b"connect_timeout_seconds: 0").is_err());
+    }
+    #[test]
+    fn bluetooth_requires_explicit_reachable_network_policy_and_bounded_static_buffer() {
+        assert!(Config::from_bytes(b"bluetooth: {enabled: true}").is_err());
+        assert!(Config::from_bytes(b"bluetooth: {enabled: true, advertise_address: 127.0.0.1, allowed_networks: ['127.0.0.0/8']}").is_ok());
+        for extra in [
+            "buffer_ms: 0",
+            "buffer_ms: 5001",
+            "lease_ms: 0",
+            "suspend_ms: 10001",
+            "listen: '127.0.0.1:0'",
+            "rtp_listen: '[::]:5004'",
+            "allowed_devices: ['bad/device']",
+        ] {
+            let text = format!(
+                "bluetooth:\n  enabled: true\n  advertise_address: 127.0.0.1\n  allowed_networks: ['127.0.0.0/8']\n  {extra}\n"
+            );
+            assert!(Config::from_bytes(text.as_bytes()).is_err(), "{extra}");
+        }
     }
     #[test]
     fn upnp_requires_explicit_valid_network_settings() {

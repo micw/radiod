@@ -1,19 +1,29 @@
+#[path = "bluetooth.rs"]
+mod bluetooth;
 use crate::{
     audio::{Audio, Event},
     config::{Config, Station},
 };
 use anyhow::Result;
+use bluetooth::Bluetooth;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::PathBuf,
     time::{Duration, Instant},
 };
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SourceKind {
+    Radio,
+    Upnp,
+    Bluetooth,
+}
 #[derive(Clone, Serialize)]
 pub struct Song {
     pub id: u32,
     pub station: Station,
     pub temporary: bool,
+    pub source: SourceKind,
 }
 #[derive(Serialize, Deserialize, Default)]
 struct Saved {
@@ -40,6 +50,7 @@ struct External {
     failed: Option<Instant>,
 }
 pub struct Core {
+    bluetooth: Bluetooth,
     pub config: Config,
     pub songs: Vec<Song>,
     pub queue: Vec<u32>,
@@ -83,6 +94,7 @@ impl Core {
                 id: i as u32 + 1,
                 station: s.clone(),
                 temporary: false,
+                source: SourceKind::Radio,
             })
             .collect();
         let current = match saved.url {
@@ -93,6 +105,7 @@ impl Core {
         let next_id = songs.len() as u32 + 1;
         let autostart = config.autostart && saved.playing && current.is_some();
         let mut c = Self {
+            bluetooth: Bluetooth::default(),
             config,
             songs,
             queue,
@@ -161,12 +174,38 @@ impl Core {
         self.set_metadata(title, artist);
     }
     pub fn save(&self) -> Result<()> {
+        if let Some(radio) = self.bluetooth.radio.as_ref() {
+            let id = radio.current.filter(|id| {
+                self.queue.contains(id)
+                    && self
+                        .song(*id)
+                        .is_some_and(|s| s.source == SourceKind::Radio)
+            });
+            let saved = Saved {
+                url: id.and_then(|id| self.song(id).map(|s| s.station.url.clone())),
+                volume: Some(self.volume),
+                playing: radio.desired && id.is_some(),
+                muted: self.muted,
+            };
+            if let Some(p) = self.path.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            let tmp = self.path.with_extension("tmp");
+            std::fs::write(&tmp, serde_json::to_vec(&saved)?)?;
+            std::fs::rename(tmp, &self.path)?;
+            return Ok(());
+        }
         let radio_current = self
             .external
             .as_ref()
             .map(|e| e.radio.current)
             .unwrap_or(self.current)
-            .filter(|id| self.queue.contains(id) && self.song(*id).is_some_and(|s| !s.temporary));
+            .filter(|id| {
+                self.queue.contains(id)
+                    && self
+                        .song(*id)
+                        .is_some_and(|s| s.source == SourceKind::Radio)
+            });
         let saved = Saved {
             url: radio_current.and_then(|id| self.song(id).map(|s| s.station.url.clone())),
             volume: Some(self.volume),
@@ -200,6 +239,9 @@ impl Core {
         }
     }
     pub fn play(&mut self) -> Result<()> {
+        if self.bluetooth_selected() {
+            return self.bluetooth_play();
+        }
         if let Some(e) = &mut self.external {
             e.failed = None;
             e.prepared = None;
@@ -207,6 +249,16 @@ impl Core {
         self.start_source()
     }
     fn start_source(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            !self.bluetooth_selected(),
+            "Bluetooth requires fresh stream offer"
+        );
+        if let Some(id) = self.current.filter(|id| {
+            self.song(*id)
+                .is_some_and(|s| s.source == SourceKind::Bluetooth)
+        }) {
+            return self.bluetooth_select(id);
+        }
         if self.current.is_none() {
             self.current = self.queue.first().copied();
         }
@@ -242,7 +294,15 @@ impl Core {
     }
     pub fn select(&mut self, id: u32) -> Result<()> {
         anyhow::ensure!(self.queue.contains(&id), "unknown song");
-        if self.song(id).is_some_and(|s| !s.temporary) && self.external.is_some() {
+        if self
+            .song(id)
+            .is_some_and(|s| s.source == SourceKind::Bluetooth)
+        {
+            return self.bluetooth_select(id);
+        }
+        self.bluetooth_override()?;
+        anyhow::ensure!(self.queue.contains(&id), "unknown song");
+        if self.song(id).is_some_and(|s| s.source == SourceKind::Radio) && self.external.is_some() {
             self.finish_external(false)?;
         }
         if self.current != Some(id) {
@@ -254,6 +314,10 @@ impl Core {
         self.play()
     }
     pub fn stop(&mut self, pause: bool) -> Result<()> {
+        if self.bluetooth_selected() {
+            return self.bluetooth_stop(pause);
+        }
+        self.bluetooth_block_present();
         if !pause && self.external.is_some() {
             self.finish_external(false)?;
         }
@@ -286,6 +350,10 @@ impl Core {
         Ok(())
     }
     fn failed(&mut self, error: String) {
+        if self.bluetooth_selected() {
+            self.bluetooth_failure(error);
+            return;
+        }
         let _ = self.audio.stop();
         if let Some(e) = &mut self.external {
             e.failed.get_or_insert_with(Instant::now);
@@ -341,6 +409,7 @@ impl Core {
         self.changed();
     }
     pub fn tick(&mut self) {
+        self.bluetooth_tick();
         if self.external.as_ref().is_some_and(|e| {
             e.prepared
                 .is_some_and(|t| t.elapsed().as_secs() >= self.config.upnp.prepared_timeout_seconds)
@@ -391,6 +460,12 @@ impl Core {
         }
     }
     pub fn reload(&mut self, new: Config) -> Result<()> {
+        let mut bluetooth = new.bluetooth.clone();
+        bluetooth.buffer_ms = self.config.bluetooth.buffer_ms;
+        anyhow::ensure!(
+            bluetooth == self.config.bluetooth,
+            "Bluetooth network/policy changes require restart"
+        );
         anyhow::ensure!(
             new.listen == self.config.listen
                 && new.alsa_device == self.config.alsa_device
@@ -403,7 +478,7 @@ impl Core {
         let old: HashMap<_, _> = self
             .songs
             .iter()
-            .filter(|s| !s.temporary)
+            .filter(|s| s.source == SourceKind::Radio)
             .map(|s| (s.station.url.clone(), s.id))
             .collect();
         let mut next_id = self.next_id;
@@ -423,11 +498,15 @@ impl Core {
                 id,
                 station: station.clone(),
                 temporary: false,
+                source: SourceKind::Radio,
             });
         }
-        if let Some(ghost) = self.songs.iter().find(|s| s.temporary) {
-            songs.push(ghost.clone());
-        }
+        songs.extend(
+            self.songs
+                .iter()
+                .filter(|s| s.source != SourceKind::Radio)
+                .cloned(),
+        );
         let removed = self
             .current
             .is_some_and(|id| !songs.iter().any(|s| s.id == id));
@@ -438,7 +517,12 @@ impl Core {
         }
         if new.stations != self.config.stations {
             self.songs = songs;
-            self.queue = self.songs.iter().map(|s| s.id).collect();
+            self.queue = self
+                .songs
+                .iter()
+                .filter(|s| s.source == SourceKind::Radio || self.queue.contains(&s.id))
+                .map(|s| s.id)
+                .collect();
             self.next_id = next_id;
             self.playlist_version += 1;
         }
@@ -472,7 +556,7 @@ impl Core {
     pub fn radio_song_ids(&self) -> Vec<u32> {
         self.songs
             .iter()
-            .filter(|s| !s.temporary)
+            .filter(|s| s.source == SourceKind::Radio)
             .map(|s| s.id)
             .collect()
     }
@@ -515,6 +599,7 @@ impl Core {
         title: Option<String>,
         artist: Option<String>,
     ) -> Result<u64> {
+        anyhow::ensure!(!self.bluetooth_selected(), "Bluetooth owns audio output");
         anyhow::ensure!(
             self.blocked_external_owner.as_deref() != Some(owner),
             "external owner overridden; Stop required before a new cast"
@@ -559,7 +644,7 @@ impl Core {
                 paused: self.state == "pause",
             }
         };
-        self.songs.retain(|s| !s.temporary);
+        self.songs.retain(|s| s.source != SourceKind::Upnp);
         self.queue
             .retain(|id| self.songs.iter().any(|s| s.id == *id));
         let id = self.next_id;
@@ -572,6 +657,7 @@ impl Core {
                 url: uri.into(),
             },
             temporary: true,
+            source: SourceKind::Upnp,
         });
         self.queue.push(id);
         self.current = Some(id);
@@ -632,13 +718,15 @@ impl Core {
             self.blocked_external_owner = Some(e.owner.clone());
         }
         let restore = restore && shutdown.is_ok();
-        self.songs.retain(|s| !s.temporary);
+        self.songs.retain(|s| s.source != SourceKind::Upnp);
         self.queue
             .retain(|id| self.songs.iter().any(|s| s.id == *id));
-        self.current = e
-            .radio
-            .current
-            .filter(|id| self.queue.contains(id) && self.song(*id).is_some_and(|s| !s.temporary));
+        self.current = e.radio.current.filter(|id| {
+            self.queue.contains(id)
+                && self
+                    .song(*id)
+                    .is_some_and(|s| s.source == SourceKind::Radio)
+        });
         self.desired = false;
         self.retry = None;
         self.started = None;

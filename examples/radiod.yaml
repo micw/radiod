@@ -20,3 +20,14 @@ upnp:
   allowed_networks: []
   prepared_timeout_seconds: 15
   failure_timeout_seconds: 10
+# Optional trusted-LAN Bluetooth receiver (WebSocket control + unicast RTP).
+# Set advertise_address and allowed_networks for your installation before enabling.
+bluetooth:
+  enabled: false
+  listen: 127.0.0.1:8092
+  rtp_listen: 0.0.0.0:5004
+  buffer_ms: 500
+  lease_ms: 6000
+  suspend_ms: 2500
+  allowed_networks: []
+  allowed_devices: []

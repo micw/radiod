@@ -55,6 +55,9 @@ pub struct Audio {
     playing_reported: bool,
     http_status: Option<u32>,
     trace: bool,
+    device: String,
+    null_output: bool,
+    rtp: Option<crate::rtp::RtpPlayback>,
 }
 
 impl Audio {
@@ -147,6 +150,9 @@ impl Audio {
             playing_reported: false,
             http_status: None,
             trace: std::env::var_os("RADIOD_TRACE_AUDIO").is_some(),
+            device: device.to_owned(),
+            null_output,
+            rtp: None,
         })
     }
 
@@ -205,7 +211,37 @@ impl Audio {
         }
     }
 
+    pub fn play_rtp(
+        &mut self,
+        format: &crate::rtp::RtpFormat,
+        listen: std::net::SocketAddr,
+        peer: std::net::IpAddr,
+        buffer_ms: u32,
+    ) -> Result<u16> {
+        self.stop()?;
+        let (playback, port) = crate::rtp::RtpPlayback::start(
+            format,
+            listen,
+            peer,
+            buffer_ms,
+            &self.device,
+            self.null_output,
+        )?;
+        self.rtp = Some(playback);
+        Ok(port)
+    }
+
+    pub fn rtp_stats(&self) -> Option<serde_json::Value> {
+        self.rtp.as_ref().map(crate::rtp::RtpPlayback::stats)
+    }
+
     pub fn stop(&mut self) -> Result<()> {
+        // Retain a failed teardown: a subsequent source must not reuse the output
+        // until the old generation has demonstrably settled at NULL.
+        if let Some(rtp) = self.rtp.as_mut() {
+            rtp.stop()?;
+            self.rtp = None;
+        }
         self.active = false;
         self.live = false;
         self.buffering = false;
@@ -334,6 +370,9 @@ impl Audio {
     }
 
     pub fn poll(&mut self) -> Vec<Event> {
+        if let Some(rtp) = self.rtp.as_mut() {
+            return rtp.poll();
+        }
         let mut events = Vec::new();
         while let Some(message) = self.bus.pop() {
             if !self.active {

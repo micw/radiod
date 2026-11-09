@@ -15,6 +15,7 @@ ipnet = { version = "2", features = ["serde"] }
 roxmltree = "0.21"
 uuid = { version = "1", features = ["v4"] }
 signal-hook = "0.3"
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 
 [build-dependencies]
 cc = "1"

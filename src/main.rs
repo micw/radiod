@@ -2,6 +2,8 @@ mod audio;
 mod config;
 mod core;
 mod mpd;
+mod receiver;
+mod rtp;
 mod upnp;
 mod volume;
 use anyhow::{Context, Result};
@@ -73,6 +75,7 @@ fn main() -> Result<()> {
         }
     });
     upnp::start(core.clone(), &state)?;
+    receiver::start(core.clone())?;
     eprintln!("radiod MPD listening on {}", listener.local_addr()?);
     mpd::serve(listener, core)
 }
