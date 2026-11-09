@@ -13,24 +13,21 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container: rust:1.99-trixie
-    env:
-      RADIOD_REQUIRE_RTP_CODECS: '1'
     steps:
       - uses: actions/checkout@v4
-      - name: Install native libraries and test plugins
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends pkg-config libgstreamer1.0-dev libasound2-dev libgupnp-1.6-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav python3
-      - run: cargo test --locked
-      - run: cargo build --locked
-      - run: target/debug/radiod --config examples/radiod.yaml --check-config
-      - run: python3 tests/smoke.py
-      - run: python3 tests/streaming.py
-      - run: python3 tests/metadata.py
-      - run: python3 tests/upnp.py
-      - run: python3 tests/receiver.py
-      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - uses: docker/setup-buildx-action@v3
+      - name: Test mandatory codecs and actual release runtime
+        # Docker's build stage runs Rust tests with both RTP codecs required;
+        # its test stage exercises every protocol against the release binary
+        # and pinned libsoup 3.8, not Debian's unsupported 3.6 HTTP stack.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   publish:
     if: github.event_name != 'pull_request'
