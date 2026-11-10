@@ -106,13 +106,22 @@ subsequent snapshots provide observed state. Rejections and five-second pending
 command expiry are reported without blocking local MPD commands.
 
 `player_state` supplies authoritative `revision`, `source`, `desired_transport`,
-`volume_percent`, `muted` and current `stream_id`. Volume requests must belong to
-the active accepted stream and a synchronized volume-capable peer. They carry an
-ID, `origin: phone` and `absolute_127`; an authoritative state with `ack_id` follows.
+`volume_percent`, `muted`, current `stream_id`, and `selected_receiver_id` /
+`selected_peer_id`. Volume authority follows that selected, synchronized peer,
+including while paused without RTP. A request with a nonempty `stream_id` must
+match the accepted stream; otherwise it must carry the exact selected `peer_id`.
+Selection grants no audio permission: changing volume while paused never resumes
+playback. Requests carry an ID, `origin: phone` and `absolute_127`; an authoritative
+state with `ack_id` follows.
 Policy denials return `accepted: false` without killing a valid connection. The
 canonical firmware must apply the initial radio volume before forwarding phone
 requests; the server also requires that it sent the still-current baseline.
 Neither a cached initial phone value nor an inactive peer may raise radio gain.
+A delayed `volume_synced` acknowledgment for an older value is a normal race during
+slider movement: return the current state without disconnecting, muting, resetting
+initial synchronization or reopening audio. Unknown ACK revisions are similarly
+nonfatal but cannot grant initial permission. Wrong session/boot/sequence envelopes
+remain invalid. Losing the control transport is not a request to set volume zero.
 
 `receiver_report` is batched at most once per second with received/last sequence,
 lost/late/duplicates, jitter, actual decoded/output counts, applied versus configured

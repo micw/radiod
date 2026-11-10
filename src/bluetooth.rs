@@ -505,17 +505,22 @@ impl Core {
                 }
             }
             "volume_synced" => {
-                anyhow::ensure!(
-                    c.volume_states
-                        .iter()
-                        .any(
-                            |(revision, volume, muted)| Some(*revision) == m["revision"].as_u64()
-                                && *volume == self.volume
-                                && *muted == self.muted
-                        ),
-                    "stale volume revision"
-                );
-                c.synced = true;
+                let current_baseline = c.volume_states.iter().any(|(revision, volume, muted)| {
+                    Some(*revision) == m["revision"].as_u64()
+                        && *volume == self.volume
+                        && *muted == self.muted
+                });
+                if current_baseline {
+                    c.synced = true;
+                } else {
+                    // Delayed ACKs are normal during rapid slider/MPD updates.
+                    // Preserve an established permission, but never grant initial
+                    // synchronization for a stale or unknown baseline.
+                    let mut state = self.bluetooth_state_for(id, c, None);
+                    state["accepted"] = json!(false);
+                    state["reason"] = json!("stale or unknown volume ACK");
+                    c.send(state);
+                }
             }
             "volume_request" => {
                 let request = text(m, "id", 64)?;
@@ -524,7 +529,12 @@ impl Core {
                     .as_u64()
                     .filter(|v| *v <= 127)
                     .ok_or_else(|| anyhow::anyhow!("invalid volume"))?;
-                let stream = text(m, "stream_id", 64)?;
+                let scope_matches = match m["stream_id"].as_str() {
+                    Some(stream) if !stream.is_empty() => {
+                        stream.len() <= 64 && c.stream.as_deref() == Some(stream)
+                    }
+                    _ => !c.peer.is_empty() && m["peer_id"].as_str() == Some(c.peer.as_str()),
+                };
                 anyhow::ensure!(m["origin"] == "phone", "invalid volume origin");
                 let allowed = self.bluetooth.active == Some(id)
                     && (c.synced
@@ -534,7 +544,8 @@ impl Core {
                                 .iter()
                                 .any(|(_, v, m)| *v == self.volume && *m == self.muted)))
                     && c.capabilities["absolute_volume"] == true
-                    && c.stream.as_deref() == Some(stream.as_str());
+                    && self.bluetooth_selected()
+                    && scope_matches;
                 if !allowed {
                     let mut state = self.bluetooth_state_for(id, c, Some(request));
                     state["accepted"] = json!(false);
@@ -573,7 +584,14 @@ impl Core {
             .active
             .and_then(|id| self.bluetooth.connections.get(&id))
             .and_then(|c| c.stream.clone());
-        json!({"type":"player_state","revision":self.revision,"source":if self.bluetooth_selected(){"bluetooth"}else if self.external.is_some(){"upnp"}else{"radio"},"desired_transport":if self.state == "pause" {"pause"}else if self.desired {"play"}else{"stop"},"volume_percent":self.volume,"muted":self.muted,"ack_id":ack,"active_stream_id":active_stream,"stream_id":active_stream})
+        let selected = self
+            .bluetooth
+            .active
+            .and_then(|id| self.bluetooth.connections.get(&id));
+        let mut state = json!({"type":"player_state","revision":self.revision,"source":if self.bluetooth_selected(){"bluetooth"}else if self.external.is_some(){"upnp"}else{"radio"},"desired_transport":if self.state == "pause" {"pause"}else if self.desired {"play"}else{"stop"},"volume_percent":self.volume,"muted":self.muted,"ack_id":ack,"active_stream_id":active_stream,"stream_id":active_stream});
+        state["selected_receiver_id"] = json!(selected.map(|c| &c.device));
+        state["selected_peer_id"] = json!(selected.map(|c| &c.peer));
+        state
     }
     pub(super) fn bluetooth_block_present(&mut self) {
         for c in self
@@ -611,6 +629,8 @@ impl Core {
         if self.bluetooth.active == Some(id) {
             state["stream_id"] = json!(c.stream);
             state["active_stream_id"] = json!(c.stream);
+            state["selected_receiver_id"] = json!(c.device);
+            state["selected_peer_id"] = json!(c.peer);
         }
         state
     }
@@ -1106,14 +1126,137 @@ mod tests {
         .unwrap();
         c.set_volume(if c.volume == 100 { 99 } else { 100 })
             .unwrap();
-        assert!(
+        message(
+            &mut c,
+            id,
+            json!({"type":"volume_synced","revision":revision}),
+        )
+        .unwrap();
+        assert!(c.bluetooth_alive(id));
+        assert!(c.bluetooth.connections[&id].synced);
+        assert!(c.bluetooth_drain(id).iter().any(|m| m["accepted"] == false));
+    }
+    #[test]
+    fn rapid_volume_requests_and_delayed_acks_preserve_latest_target() {
+        let (mut c, id) = fixture();
+        message(&mut c, id, snapshot("Phone", true)).unwrap();
+        let song = c.bluetooth.connections[&id].song.unwrap();
+        c.select(song).unwrap();
+        c.bluetooth_tick();
+        let baseline = c
+            .bluetooth_drain(id)
+            .into_iter()
+            .rev()
+            .find(|m| m["type"] == "player_state")
+            .unwrap()["revision"]
+            .clone();
+        message(
+            &mut c,
+            id,
+            json!({"type":"volume_synced","revision":baseline}),
+        )
+        .unwrap();
+        c.bluetooth.connections.get_mut(&id).unwrap().stream = Some("stream".into());
+        let mut delayed = Vec::new();
+        for (i, target) in [20, 60, 110, 127, 0, 93].into_iter().enumerate() {
+            message(&mut c,id,json!({"type":"volume_request","id":format!("rapid-{i}"),"stream_id":"stream","origin":"phone","absolute_127":target})).unwrap();
+            delayed.extend(
+                c.bluetooth_drain(id)
+                    .into_iter()
+                    .filter(|m| m["type"] == "player_state")
+                    .map(|m| m["revision"].clone()),
+            );
+        }
+        let latest = c.volume;
+        let revision = c.revision;
+        for ack in delayed {
+            message(&mut c, id, json!({"type":"volume_synced","revision":ack})).unwrap();
+        }
+        assert_eq!(c.volume, latest);
+        assert_eq!(latest, 73);
+        assert_eq!(c.revision, revision);
+        assert!(c.desired);
+        assert_ne!(c.state, "pause");
+        assert_eq!(
+            c.bluetooth.connections[&id].stream.as_deref(),
+            Some("stream")
+        );
+        assert!(c.bluetooth_alive(id));
+        assert!(c.bluetooth_drain(id).iter().all(|m| m["type"] != "command"));
+    }
+    #[test]
+    fn initial_ack_after_mpd_volume_change_is_nonfatal_without_permission() {
+        let (mut c, id) = fixture();
+        let revision = c.bluetooth.connections[&id].volume_states.back().unwrap().0;
+        message(&mut c, id, snapshot("Phone", true)).unwrap();
+        c.set_volume(37).unwrap();
+        for ack in [revision, u64::MAX] {
+            message(&mut c, id, json!({"type":"volume_synced","revision":ack})).unwrap();
+            assert!(!c.bluetooth.connections[&id].synced);
+            assert_eq!(c.volume, 37);
+            assert!(c.bluetooth_alive(id));
+        }
+        let current = c
+            .bluetooth_drain(id)
+            .into_iter()
+            .rev()
+            .find(|m| m["type"] == "player_state")
+            .unwrap()["revision"]
+            .clone();
+        message(
+            &mut c,
+            id,
+            json!({"type":"volume_synced","revision":current}),
+        )
+        .unwrap();
+        assert!(c.bluetooth.connections[&id].synced);
+    }
+    #[test]
+    fn local_pause_allows_only_selected_peer_volume_without_resuming() {
+        let (mut c, a) = fixture();
+        message(&mut c, a, snapshot("A", true)).unwrap();
+        let b = c.bluetooth_open("127.0.0.1".parse().unwrap()).unwrap();
+        c.bluetooth_message(b,json!({"v":1,"type":"hello","seq":1,"device_id":"other","boot_id":"boot","firmware":"test","capabilities":{"play":true,"pause":true,"absolute_volume":true,"metadata":false},"codecs":["sbc"]})).unwrap();
+        message(&mut c, b, snapshot("B", true)).unwrap();
+        let song = c.bluetooth.connections[&a].song.unwrap();
+        c.select(song).unwrap();
+        c.stop(true).unwrap();
+        c.bluetooth_tick();
+        for id in [a, b] {
+            let state = c
+                .bluetooth_drain(id)
+                .into_iter()
+                .rev()
+                .find(|m| m["type"] == "player_state")
+                .unwrap();
+            assert_eq!(state["selected_receiver_id"], "receiver");
+            assert_eq!(state["selected_peer_id"], "phone");
             message(
                 &mut c,
                 id,
-                json!({"type":"volume_synced","revision":revision})
+                json!({"type":"volume_synced","revision":state["revision"]}),
             )
-            .is_err()
-        );
+            .unwrap();
+        }
+        message(&mut c,a,json!({"type":"volume_request","id":"paused","peer_id":"phone","origin":"phone","absolute_127":64})).unwrap();
+        assert_eq!(c.volume, 50);
+        let response = c.bluetooth_drain(a);
+        assert!(response.iter().any(|m| m["ack_id"] == "paused"
+            && m["selected_receiver_id"] == "receiver"
+            && m["selected_peer_id"] == "phone"));
+        for (id, stream, peer) in [
+            (b, "", "phone"),
+            (a, "stale-stream", "phone"),
+            (a, "", "wrong"),
+        ] {
+            message(&mut c,id,json!({"type":"volume_request","id":format!("denied-{id}-{stream}-{peer}"),"stream_id":stream,"peer_id":peer,"origin":"phone","absolute_127":127})).unwrap();
+            assert_eq!(c.volume, 50);
+            assert!(c.bluetooth_drain(id).iter().any(|m| m["accepted"] == false));
+        }
+        assert_eq!(c.state, "pause");
+        assert!(!c.desired);
+        assert!(c.bluetooth.connections[&a].stream.is_none());
+        assert_eq!(c.current, Some(song));
     }
     #[test]
     fn inactive_volume_request_is_a_policy_response_not_a_disconnect() {

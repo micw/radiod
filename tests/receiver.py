@@ -265,6 +265,7 @@ def main():
     audio = (ROOT / 'tests/fixtures/live.aac').read_bytes()
     frames = adts_frames(audio)
     active = set()
+    uri_gets = []
     lock = threading.Lock()
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -272,6 +273,7 @@ def main():
             token = object()
             with lock:
                 active.add(token)
+                uri_gets.append(self.path)
             try:
                 self.connection.settimeout(.5)
                 self.send_response(200)
@@ -417,10 +419,88 @@ def main():
                 ws.wait('stream_accept', lambda m: m['stream_id'] == stream)
                 launch(2)
                 eventually(actual_play, 'fresh explicit generation did not decode')
+                # Synchronize once, then send the slider burst without waiting for ACKs.
+                mpd.command('setvol 17')
+                baseline = ws.wait('player_state', lambda m: m['volume_percent'] == 17)
+                ws.send('volume_synced', revision=baseline['revision'])
+                session = ws.session
+                with lock:
+                    gets_before = len(uri_gets)
+                for index, value in enumerate((38, 76, 114)):
+                    ws.send('volume_request', id='slider-%d' % index, stream_id=stream,
+                            origin='phone', absolute_127=value)
+                for index, expected in enumerate((30, 60, 90)):
+                    latest = ws.wait('player_state', lambda m, i=index:
+                                     m.get('ack_id') == 'slider-%d' % i)
+                    check(latest['volume_percent'] == expected and latest.get('accepted') is not False,
+                          'rapid slider request rejected or applied out of order')
+                check(latest['revision'] > baseline['revision'], 'slider revision did not advance')
+                ws.send('volume_synced', revision=baseline['revision'])
+                stale = ws.wait('player_state', lambda m: m.get('accepted') is False)
+                check(stale['volume_percent'] == 90 and stale['active_stream_id'] == stream,
+                      'known stale volume ACK changed latest target/stream')
+                ws.send('volume_synced', revision=latest['revision'] + 1000000)
+                unknown = ws.wait('player_state', lambda m: m.get('accepted') is False)
+                check(unknown['volume_percent'] == 90 and unknown['active_stream_id'] == stream and
+                      unknown['desired_transport'] == stale['desired_transport'] == 'play',
+                      'unknown volume ACK changed target/stream or paused transport')
+                ws.send('heartbeat')
+                ws.wait('heartbeat_ack')
+                check(ws.session == session and mpd.fields('status')['volume'] == '90' and
+                      mpd.fields('status').get('radiod_state') == 'play' and
+                      mpd.fields('currentsong')['Id'] == ident,
+                      'late/unknown ACK replaced session, paused/stopped audio, or changed owner')
+                check(stale['selected_receiver_id'] == unknown['selected_receiver_id'] == ws.device and
+                      stale['selected_peer_id'] == unknown['selected_peer_id'] == 'phone',
+                      'playing selected receiver/peer identity missing')
+                with lock:
+                    check(len(uri_gets) == gets_before, 'volume ACK reopened URI source')
+                check(not any(m.get('type') == 'error' or
+                              (m.get('seq', 0) > baseline['seq'] and
+                               m.get('type') in ('welcome', 'command', 'stream_accept'))
+                              for m in ws.messages), 'volume ACK restarted receiver transport/session')
                 mpd.command('pause 1')
                 check(mpd.fields('status').get('radiod_state') == 'pause', 'local pause waited for remote ACK')
                 ws.hold(.5)
                 check(mpd.fields('currentsong')['Id'] == ident, 'manual pause unexpectedly auto-returned radio')
+                paused = ws.wait('player_state', lambda m: m['desired_transport'] == 'pause' and
+                                 m['revision'] > latest['revision'] and m.get('active_stream_id') is None)
+                check(paused['selected_receiver_id'] == ws.device and paused['selected_peer_id'] == 'phone',
+                      'pause cleared selected receiver/peer identity')
+                ws.send('volume_request', id='paused-owner', peer_id='phone',
+                        origin='phone', absolute_127=51)
+                paused_ack = ws.wait('player_state', lambda m: m.get('ack_id') == 'paused-owner')
+                check(paused_ack['volume_percent'] == 40 and paused_ack.get('accepted') is not False and
+                      paused_ack['desired_transport'] == 'pause' and paused_ack['active_stream_id'] is None and
+                      paused_ack['selected_receiver_id'] == ws.device and paused_ack['selected_peer_id'] == 'phone',
+                      'paused peer-scoped owner volume rejected, resumed, or lost selection')
+                paused_rival = WS(wp, device='paused-other-receiver')
+                peers.append(paused_rival)
+                paused_rival.snapshot(name='Paused other phone')
+                rival_baseline = paused_rival.wait('player_state', lambda m: m['volume_percent'] == 40)
+                paused_rival.send('volume_synced', revision=rival_baseline['revision'])
+                paused_rival.send('volume_request', id='paused-nonowner', peer_id='phone',
+                                  origin='phone', absolute_127=127)
+                denied = paused_rival.wait('player_state', lambda m: m.get('ack_id') == 'paused-nonowner')
+                check(denied.get('accepted') is False and denied['volume_percent'] == 40 and
+                      denied['selected_receiver_id'] == ws.device and denied['selected_peer_id'] == 'phone',
+                      'paused nonselected peer changed volume or selected identity')
+                paused_rival.send('heartbeat')
+                paused_rival.wait('heartbeat_ack')
+                paused_rival.snapshot(connected=False)
+                paused_rival.send('heartbeat')
+                paused_rival.wait('heartbeat_ack')
+                paused_rival.close()
+                ws.send('heartbeat')
+                ws.wait('heartbeat_ack')
+                check(mpd.fields('status')['volume'] == '40' and
+                      mpd.fields('status').get('radiod_state') == 'pause' and
+                      mpd.fields('currentsong')['Id'] == ident,
+                      'paused volume request resumed audio or changed selected song')
+                with lock:
+                    check(len(uri_gets) == gets_before, 'paused volume request reopened URI source')
+                # Preserve the established baseline for the existing lifecycle cases.
+                mpd.command('setvol 8')
                 eventually(lambda: (ws.pump() or True) and not active,
                            'previous radio HTTP GET remained active after takeover', timeout=3)
                 mpd.command('stop')
