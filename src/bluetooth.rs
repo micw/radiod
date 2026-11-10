@@ -379,6 +379,7 @@ impl Core {
                             source: SourceKind::Bluetooth,
                         });
                         self.queue.push(song);
+                        self.prioritize_bluetooth();
                         c.song = Some(song);
                         self.playlist_version += 1;
                         self.changed();

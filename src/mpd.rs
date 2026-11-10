@@ -381,7 +381,9 @@ fn execute(c: &mut Core, a: &[String]) -> Reply {
             if cmd == "lsinfo" {
                 out.push_str("playlist: radio\nLast-Modified: 1970-01-01T00:00:00Z\n");
             }
-            for s in c.songs.iter().filter(|s| s.source != SourceKind::Upnp) {
+            let mut entries: Vec<_> = c.songs.iter().filter(|s| s.source != SourceKind::Upnp).collect();
+            entries.sort_by_key(|s| s.source != SourceKind::Bluetooth);
+            for s in entries {
                 out.push_str(&song(c, s.id, None, cmd != "listall"));
             }
         }

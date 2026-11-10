@@ -142,7 +142,18 @@ impl Core {
     pub fn changed(&mut self) {
         self.revision += 1;
     }
+    pub fn prioritize_bluetooth(&mut self) {
+        let bluetooth: std::collections::HashSet<u32> = self
+            .songs
+            .iter()
+            .filter(|s| s.source == SourceKind::Bluetooth)
+            .map(|s| s.id)
+            .collect();
+        // Stable partition: identities and relative radio order are untouched.
+        self.queue.sort_by_key(|id| !bluetooth.contains(id));
+    }
     pub fn queue_updated(&mut self) {
+        self.prioritize_bluetooth();
         if let Some(e) = &mut self.external
             && e.radio.current.is_some_and(|id| !self.queue.contains(&id))
         {
@@ -523,6 +534,7 @@ impl Core {
                 .filter(|s| s.source == SourceKind::Radio || self.queue.contains(&s.id))
                 .map(|s| s.id)
                 .collect();
+            self.prioritize_bluetooth();
             self.next_id = next_id;
             self.playlist_version += 1;
         }
@@ -812,6 +824,31 @@ mod tests {
         c.stop(false).unwrap();
         assert!(c.retry.is_none());
         assert!(!c.desired);
+    }
+    #[test]
+    fn bluetooth_priority_keeps_ids_current_and_relative_radio_order() {
+        let mut c = fixture();
+        let radios = c.queue.clone();
+        let current = c.current;
+        c.songs.push(Song {
+            id: 77,
+            station: Station {
+                name: "Bluetooth · phone".into(),
+                url: "bluetooth://receiver/phone".into(),
+            },
+            temporary: true,
+            source: SourceKind::Bluetooth,
+        });
+        c.queue.push(77);
+        c.queue_updated();
+        assert_eq!(c.queue[0], 77);
+        assert_eq!(&c.queue[1..], radios.as_slice());
+        assert_eq!(c.current, current);
+        assert_eq!(c.radio_song_ids(), radios);
+        assert_eq!(
+            c.song(77).unwrap().station.url,
+            "bluetooth://receiver/phone"
+        );
     }
     #[test]
     fn reload_preserves_ids_and_stops_removed() {

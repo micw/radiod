@@ -343,6 +343,10 @@ def main():
                 eventually(lambda: len(mpd.rows()) == 2, 'paused snapshot did not create phone')
                 phone = next(r for r in mpd.rows() if r['file'].startswith('bluetooth://'))
                 ident = phone['Id']
+                check(mpd.rows()[0]['Id'] == ident and phone.get('Pos') == '0',
+                      'Bluetooth phone must be first without changing its song ID')
+                check([r['Id'] for r in mpd.rows() if not r['file'].startswith('bluetooth://')] == [radio],
+                      'Bluetooth priority changed relative radio ordering/IDs')
                 check('Actual phone' in phone.get('Name', ''), 'actual phone name missing')
                 version = mpd.fields('status')['playlist']
                 ws.snapshot()
@@ -353,6 +357,7 @@ def main():
                            'name update did not preserve ID/update MPD cache')
                 check(mpd.command('listplaylistinfo "radio"') == library, 'virtual entry polluted radio playlist')
                 available = mpd.rows('listallinfo')
+                check(available[0]['file'] == phone['file'], 'Bluetooth must lead the available MPD catalogue too')
                 check(len(available) == 2 and sum(r['file'].startswith('bluetooth://') for r in available) == 1,
                       'MPD library lost radio or duplicated virtual phone')
                 check(mpd.fields('status').get('radiod_state') == 'stop', 'paused presence started audio')

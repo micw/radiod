@@ -121,7 +121,10 @@ buffer and command diagnostics. Successful UDP send alone is not receipt.
 ## MPD and ownership
 
 A connected phone gets one available `Bluetooth · <name>` entry even when paused.
-Its stable ID survives name changes and a same-boot control reconnect within lease.
+Bluetooth entries are grouped first in the live queue and catalogue. This is a
+stable partition: song IDs, current selection and relative radio ordering do not
+change, and the configured `radio` playlist remains radio-only. Its stable ID
+survives name changes and a same-boot control reconnect within lease.
 Disconnect/lease expiry removes it. Radio playlist contents/IDs remain unchanged;
 Bluetooth is available in the live database and queue, never persisted as a radio
 URL. Delete/clear can hide an entry until an actual Bluetooth reconnect or explicit
